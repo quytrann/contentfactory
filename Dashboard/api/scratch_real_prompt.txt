@@ -1,0 +1,114 @@
+You are a scriptwriter for a Vietnamese short-video channel that RE-EDITS foreign content. The source material (footage) is only ILLUSTRATION; your Vietnamese commentary is the main content. Below is the source transcript with timestamps (seconds).
+
+MODE: SUMMARY (near-full faithful retell). THIS IS NOT A RECAP — do NOT condense hard and do NOT add analysis. KEEP ~76-90% of the source: retell ALL the substantive content in the original's EXACT chronological ORDER (do NOT reorder), faithfully covering every argument, detail, example, and development in the channel's own Vietnamese narrating voice (NOT a verbatim translation). You MAY ONLY cut FILLER: like/subscribe/follow prompts, thank-yous, channel self-promotion, sponsor reads, bloated intros/outros, silent/dead gaps, and verbatim repetition. NEVER drop real content just to make it shorter, and do NOT inject your own take/opinion — this is a faithful retell, not a commentary. Output length tracks the source MINUS the filler. The original footage is illustration; your Vietnamese narration leads and is the main content; no verbatim copying, no reupload. Write ALL narration in Vietnamese.
+
+SAFETY RULES (mandatory):
+1. Real transformation — analyze, reorder, add a take; do NOT translate verbatim.
+2. Your voice is the main content (>60-80%); the source footage is illustration only.
+3. The opening has a strong hook in the first 3-5 seconds.
+4. KEEP ENGLISH TERMS AS-IS: technical terms, proper nouns, product/library/technology names (e.g. agent harness, context window, token, prompt, API, framework, GitHub...) MUST stay in English in the narration — do NOT translate, transliterate, or Vietnamize them. Embed them naturally inside the Vietnamese sentence (e.g. "context window của model"). This helps the TTS pronounce correctly and keeps captions accurate.
+5. CUT THE NON-CONTENT SEGMENTS: completely drop ads, like/subscribe/follow prompts for the original channel, sponsor reads, channel self-promotion, bloated intros/outros, and silent/dead gaps that carry no information. Do NOT retell them and do NOT create scenes for them. Do NOT pick the ad/subscribe/sponsor/intro/outro time ranges as illustrative footage (sourceStart/sourceEnd).
+
+Source transcript (seconds, only within 0-500s):
+"""
+[0.0-3.1] {"sourceUrl": "https://www.youtube.com/watch?v=1a1VXDdIyrk", "videoId": "1a1VXDdIyrk", "title": "Agent Harness explained in 8min..", "uploader": "Caleb Writes Code", "handle": "@CalebWritesCode", "logoPath": "E:\\ContentFactory\\Giải Thích Mọi Thứ\\source\\1a1VXDdIyrk_logo.jpg", "durationS": 499.904,
+[3.1-6.2] "thumbnail": "https://i.ytimg.com/vi/1a1VXDdIyrk/maxresdefault.jpg", "audioPath": "E:\\ContentFactory\\Giải Thích Mọi Thứ\\source\\1a1VXDdIyrk.wav", "language": "en", "transcript": "Agent harness is just one of those terms that is so confusing to
+[6.2-9.4] understand because of how broad and also specific the term harnessing actually is. A common rhetoric out there is that harness refers to
+[9.4-12.5] an environment for the agent. But that still doesn't really help us understand what it is and what it isn't. How exactly is
+[12.5-15.6] harness engineering different from prompt engineering and context engineering? Welcome to Caleb Wright's code where every second counts. Quick shout out to cursor,
+[15.6-18.8] warn them later. To put it simply, harness engineering actually existed before the term harness was coined around early 2026. Shortly after the
+[18.8-21.9] release of ChachiPT in 2022, we were dealing mostly in the context window of 4,000 tokens, and this small context window really limited
+[21.9-25.0] our ability to do anything substantial with it. And we could build an agent around this, but what we found is that simple
+[25.0-28.1] prompting ChachiPT to get what we want to do just wasn't good enough. So the question started to emerge on how to recycle
+[28.1-31.2] this small memory space to effectively do more with less. So we quickly expanded from prompt engineering to context engineering by using various
+[31.2-34.4] techniques like tool calling, MCP, and RAG for the purpose of managing the context window more efficiently. Tool calling allowed us to explore
+[34.4-37.5] the repository and read only specific files that are relevant to the task at hand and creating actions externally. MCP allowed vendor-specific features
+[37.5-40.6] to be added on top of the model, and finally, RAG allowed custom databases to be connected for on-demand data to be available
+[40.6-43.8] at any time. All these techniques gave birth to a new era of agents, mostly encoding agents. Cursor, Winserv, Klein, Roo, and Ader
+[43.8-46.9] are all examples of early players that adopted tool calling for context engineering, and they were really good tools that got the job
+[46.9-50.0] done. While all of this work was undergoing, the underlying models actually evolved and context window started to grow as well, which meant
+[50.0-53.1] that coding agents started to be able to do longer duration tasks, and that's exactly what we were seeing. People started to ask
+[53.1-56.2] these coding agents to work on features and bug fixes at a bigger and bigger scope, and suddenly, context engineering that autonomously loaded
+[56.2-59.4] proper context and take necessary actions gave these coding agents more and more ability to work on more complex tasks. But even this
+[59.4-62.5] had its own limits. Because as the duration of tasks got longer, and we asked the coding agents some incredibly long tasks like
+[62.5-65.6] clone an entire website, a simple prompt engineering will give you a very sketchy website because it can only respond in one shot.
+[65.6-68.8] And even with context engineering, the result you got was not that great given the huge scope of the task. Not because context
+[68.8-71.9] engineering was necessarily bad, but because you have symptoms like this where the website will be partially finished and some buttons would just
+[71.9-75.0] not work and features aren't really tested all the way through. And one major issue with context engineering was that we typically use
+[75.0-78.1] context summarization to essentially keep shrinking down the context as it was topping up. So if the task that we gave to an
+[78.1-81.2] agent took, let's say 12 hours, as the context window started to fill up, it would summarize its context to shrink it and
+[81.2-84.4] continue working on them without having to run out of context window. So effectively, the agent was bound by its own ability to
+[84.4-87.5] properly summarize its previous work. And that's why you see tasks that are either half completed or not even attempted at all. If
+[87.5-90.6] context started to fill up mid task, it would summarize and assume the task is already finished in some instances, or oversimplify the
+[90.6-93.8] task and assume some features are completed and verified when it really wasn't. So as much as this elastic way of self managing
+[93.8-96.9] the context window gave the appearance of ability to work on longer range tasks, it really wasn't all that effective. Now this narrative
+[96.9-100.0] I'm putting out here is an overview of what happened in the past, meaning people had been experimenting with different ways to get
+[100.0-103.1] around this problem by implementing sub agents for hierarchical context management, or even swarms of agents where you deploy multiple agents with their
+[103.1-106.2] own context window. So we were already converging towards a point of harnessing the underlying agents. And as you can see, having a
+[106.2-109.4] better orchestration layer and having a better execution environment and better context management are all ingredients that we needed to master for harnessing
+[109.4-112.5] the agent. And this is when the concept of harnessing an agent or agent harness started to emerge and officially coined the term
+[112.5-115.6] in early 2026. And while you can certainly make the argument that harnessing is a buzzword, it does capture the essence of something
+[115.6-118.8] transformative that was happening in the AI industry. So the question is, how is harnessing an agent really different from what we've seen
+[118.8-121.9] before? But first, a quick word from cursor, I'm always trying to build on my website, but not only do I have multiple
+[121.9-125.0] devices that I have to keep track of, but I also want to keep working on them on my browser or my phone
+[125.0-128.1] without having to set up the entire project on my devices. I use cursor for that reason. For example, I can see that
+[128.1-131.2] the models tab on my website is already behind in information since open AI released newer models since so I can just spin
+[131.2-134.4] up cursor locally to keep this up to date. And while the agent is working on that, I can concurrently fix different features
+[134.4-137.5] at the same time, spawning multiple agents with their own context as needed. Pretty cool. But I want to raise a bar with
+[137.5-140.6] cloud agents, I can actually have this entire thing run on cloud instead of my desktop, which means I can just close cursor
+[140.6-143.8] and the job will continue on without my machine and create a pull request once it's done. Pretty cool. But I want to
+[143.8-146.9] raise a bar again, I can integrate with slack to send my feature request to cursor and it'll also run the cloud agent
+[146.9-150.0] to get the job done and ping me once it's done with a PR. Pretty cool. But now I want to raise a
+[150.0-153.1] bar again. Now I want to take this website and somewhat run it autonomously because I don't want to manually check for new
+[153.1-156.2] information. I can add automation in the cloud to check daily for new model releases and cursor now keeps my website up to
+[156.2-159.4] date autonomously. One of the most critical changes that happened with the rise of harness engineering was the idea of loops by stepping
+[159.4-162.5] away one layer above context engineering and essentially looping the agent in a loop where at each iteration, they have a fresh clean
+[162.5-165.6] set of context, but under a strict rule of how the agent should start and finish its tasks, we started to see an
+[165.6-168.8] incredible result by putting the agent under this very environment. One of the primary example is raw, which took over the internet given
+[168.8-171.9] how effective it was, but more importantly, just how simple the architecture was underneath. One clarification to be made here is that harness
+[171.9-175.0] engineering doesn't necessarily deprecate context engineering and it certainly doesn't deprecate prompt engineering. If you peek below open source coding agents like Klein,
+[175.0-178.1] you see that their system prompt is still largely driven by a well written prompt. So prompt engineering is still used, but a
+[178.1-181.2] much smaller component in comparison to the system as whole. So prompt engineering reminds the coding agents who the agent is and gives
+[181.2-184.4] them the persona of a coding agents and the layer above that is context management and context engineering. So harness engineering effectively leverages
+[184.4-187.5] both prompt and context engineering. It's a shift away from relying on these two approaches, but a paradigm change on the environment that
+[187.5-190.6] puts the agent into a series of steps where typically you start by generating a large requirement file and then looping each task
+[190.6-193.8] and selecting only one task to be completed from the document and it tests and documents each steps and this loop continues on
+[193.8-196.9] iteration after iteration until the entire step is finished. And at each iteration, they're given a fresh set of prompt and fresh set
+[196.9-200.0] of context. You see this kind of architecture mirrored in Ralph's documentation as well, where it first starts with creating a production requirement
+[200.0-203.1] document, which gets outlined into a JSON file and it goes into a loop implementing feature after feature until completion. And you can
+[203.1-206.2] see just how simple this entire architecture is when you look at how small the repository really is. Same thing for Anthropic's simple
+[206.2-209.4] demonstration of harnessing when we look at their repository. Another story here, lightweight and simple environment. In fact, many coding agents now have
+[209.4-212.5] already adopted this harnessing layer directly inside the application, although each of them implemented their own way of harnessing their agents. That's why
+[212.5-215.6] you're seeing so many companies talking about harnessing layer these days because of how effective it really is.", "segments": [{"start": 0.0, "end": 4.32,
+[215.6-218.8] "text": "Agent harness is just one of those terms that is so confusing to understand because of how"}, {"start": 4.32, "end": 8.2, "text":
+[218.8-221.9] "broad and also specific the term harnessing actually is."}, {"start": 8.2, "end": 12.78, "text": "A common rhetoric out there is that harness refers
+[221.9-225.0] to an environment for the agent."}, {"start": 12.78, "end": 16.44, "text": "But that still doesn't really help us understand what it is and
+[225.0-228.1] what it isn't."}, {"start": 16.44, "end": 21.28, "text": "How exactly is harness engineering different from prompt engineering and context engineering?"}, {"start": 21.28, "end":
+[228.1-231.2] 23.72, "text": "Welcome to Caleb Wright's code where every second counts."}, {"start": 23.72, "end": 25.38, "text": "Quick shout out to cursor, warn them
+[231.2-234.4] later."}, {"start": 25.38, "end": 30.38, "text": "To put it simply, harness engineering actually existed before the term harness was coined"}, {"start": 30.38, "end":
+[234.4-237.5] 32.18, "text": "around early 2026."}, {"start": 32.18, "end": 36.94, "text": "Shortly after the release of ChachiPT in 2022, we were dealing mostly in
+[237.5-240.6] the context window"}, {"start": 36.94, "end": 42.34, "text": "of 4,000 tokens, and this small context window really limited our ability to do anything"},
+[240.6-243.8] {"start": 42.34, "end": 43.78, "text": "substantial with it."}, {"start": 43.78, "end": 49.18, "text": "And we could build an agent around this, but what
+[243.8-246.9] we found is that simple prompting ChachiPT"}, {"start": 49.18, "end": 51.72, "text": "to get what we want to do just wasn't good enough."},
+[246.9-250.0] {"start": 51.72, "end": 57.26, "text": "So the question started to emerge on how to recycle this small memory space to effectively"}, {"start": 57.26,
+[250.0-253.1] "end": 58.84, "text": "do more with less."}, {"start": 58.84, "end": 64.56, "text": "So we quickly expanded from prompt engineering to context engineering by
+[253.1-256.2] using various techniques"}, {"start": 64.56, "end": 70.8, "text": "like tool calling, MCP, and RAG for the purpose of managing the context window more
+[256.2-259.4] efficiently."}, {"start": 70.8, "end": 76.56, "text": "Tool calling allowed us to explore the repository and read only specific files that are relevant"}, {"start":
+[259.4-262.5] 76.56, "end": 79.96, "text": "to the task at hand and creating actions externally."}, {"start": 79.96, "end": 85.24, "text": "MCP allowed vendor-specific features to
+[262.5-265.6] be added on top of the model, and finally, RAG"}, {"start": 85.24, "end": 90.96, "text": "allowed custom databases to be connected for on-demand
+[265.6-268.8] data to be available at any time."}, {"start": 90.96, "end": 95.8, "text": "All these techniques gave birth to a new era of agents,
+[268.8-271.9] mostly encoding agents."}, {"start": 95.8, "end": 101.6, "text": "Cursor, Winserv, Klein, Roo, and Ader are all examples of early players that adopted"}, {"start":
+[271.9-275.0] 101.6, "end": 106.0, "text": "tool calling for context engineering, and they were really good tools that got the job"}, {"start": 106.0, "end": 107.0,
+[275.0-278.1] "text": "done."}, {"start": 107.0, "end": 112.0, "text": "While all of this work was undergoing, the underlying models actually evolved and context"}, {"start": 112.0,
+[278.1-281.2] "end": 116.14, "text": "window started to grow as well, which meant that coding agents started to be able to do"}, {"start": 116.14, "end":
+[281.2-284.4] 120.26, "text": "longer duration tasks, and that's exactly what we were seeing."}, {"start": 120.26, "end": 125.12, "text": "People started to ask these coding
+"""
+
+HARD WORD CAP (ABSOLUTE MAXIMUM, NOT a target): the TOTAL Vietnamese narration across ALL scenes must be AT MOST 939 words. This is a strict ceiling, not a goal — fewer is fine, more is FORBIDDEN. (This source span is 500s; staying under the cap keeps the finished video shorter than the source.)
+This is SUMMARY mode: the source has FAR MORE content than fits in 939 words, so you MUST CONDENSE. SELECT only the most important beats and summarize them tightly; DROP less-important detail, examples, asides, and all filler (subscribe/thanks/self-promo/sponsor/intro/outro/silent gaps/repetition). Do NOT try to cover everything. Do NOT pad. Do NOT cram. Keep the source's time ORDER (0-500s).
+PER-SCENE BUDGET: aim for about 52 words per scene — keep each narration tight, 1-3 short Vietnamese sentences. The scene count is a SOFT TARGET (~18): use fewer or more as the content's natural structure requires, but the total word cap above always wins.
+REJECTION RULE: any script whose total narration EXCEEDS 939 words will be REJECTED outright. It is far better to cover LESS content faithfully and concisely than to exceed the cap. For EACH scene:
+- 'narration': the spoken Vietnamese line, concise and natural (your commentary/recap). Write all 'narration' in VIETNAMESE (the channel's own voice) — do NOT output English narration.
+- 'sourceStart','sourceEnd': the time range (seconds) in the transcript above to TAKE illustrative footage for that scene — must lie within 0-500s, each clip ~3-8 seconds.
+Pick the worthwhile moments; you may reorder them for a better narrative flow.
+Return ONLY a single valid JSON array, no markdown. Each element: {"scene": <number from 1>, "narration": "<Vietnamese>", "sourceStart": <seconds>, "sourceEnd": <seconds>}.

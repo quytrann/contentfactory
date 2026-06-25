@@ -1,0 +1,18 @@
+<svg width="600" height="600" viewBox="0 0 600 600" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Game Story monogram GS">
+  <!-- Logo 2: GS monogram. The "G" opening forms a play arc; the "S" is a story/speech ribbon. Square format for avatars & thumbnail badges. -->
+  <rect width="600" height="600" rx="120" fill="#16161D"/>
+
+  <!-- Outer ring -->
+  <circle cx="300" cy="300" r="190" fill="none" stroke="#2A2A35" stroke-width="14"/>
+
+  <!-- G as an open arc with a play notch -->
+  <path d="M300 130
+           A170 170 0 1 0 470 300
+           L355 300
+           L355 360
+           L300 360"
+        fill="none" stroke="#FFFFFF" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Play triangle accent inside the G mouth -->
+  <path d="M285 268 L285 332 L340 300 Z" fill="#FF4D4D"/>
+</svg>

@@ -1,0 +1,352 @@
+[
+    {
+        "scene": 1,
+        "narration": "Agent harness là thuật ngữ khó hiểu vì nó vừa rộng vừa cụ thể.",
+        "sourceEnd": 7.0,
+        "sourceStart": 0.0
+    },
+    {
+        "scene": 2,
+        "narration": "Nhiều người nói harness là môi trường cho agent, nhưng định nghĩa đó vẫn chưa đủ.",
+        "sourceEnd": 15.0,
+        "sourceStart": 8.2
+    },
+    {
+        "scene": 3,
+        "narration": "Vậy harness engineering khác gì so với prompt engineering và context engineering?",
+        "sourceEnd": 21.3,
+        "sourceStart": 16.4
+    },
+    {
+        "scene": 4,
+        "narration": "Harness engineering thực ra đã tồn tại trước khi thuật ngữ này được đặt ra vào đầu 2026.",
+        "sourceEnd": 32.0,
+        "sourceStart": 25.4
+    },
+    {
+        "scene": 5,
+        "narration": "Khi ChatGPT ra mắt năm 2022, context window chỉ có 4.000 token, quá nhỏ để làm gì đáng kể.",
+        "sourceEnd": 39.0,
+        "sourceStart": 32.2
+    },
+    {
+        "scene": 6,
+        "narration": "Xây agent được, nhưng chỉ prompting đơn giản thôi là chưa đủ.",
+        "sourceEnd": 51.0,
+        "sourceStart": 43.8
+    },
+    {
+        "scene": 7,
+        "narration": "Câu hỏi nảy sinh: làm sao tận dụng bộ nhớ nhỏ để làm được nhiều hơn?",
+        "sourceEnd": 58.8,
+        "sourceStart": 51.7
+    },
+    {
+        "scene": 8,
+        "narration": "Từ đó chúng ta chuyển sang context engineering, dùng tool calling, em-xê-pê, và rát, để quản lý context window tốt hơn.",
+        "display": "Từ đó chúng ta chuyển sang context engineering, dùng tool calling, MCP, và RAG để quản lý context window tốt hơn.",
+        "sourceEnd": 68.0,
+        "sourceStart": 60.0
+    },
+    {
+        "scene": 9,
+        "narration": "Tool calling giúp agents đọc fai liên quan và tạo hành động bên ngoài.",
+        "display": "Tool calling giúp agents đọc file liên quan và tạo hành động bên ngoài.",
+        "sourceEnd": 76.0,
+        "sourceStart": 71.0
+    },
+    {
+        "scene": 10,
+        "narration": "Em-xê-pê, thêm tính năng đặc thù của vendor vào model.",
+        "display": "MCP thêm tính năng đặc thù của vendor vào model.",
+        "sourceEnd": 85.0,
+        "sourceStart": 80.0
+    },
+    {
+        "scene": 11,
+        "narration": "Rát, kết nối cơ sở dữ liệu tùy chỉnh, luôn sẵn có.",
+        "display": "RAG kết nối cơ sở dữ liệu tùy chỉnh, luôn sẵn có.",
+        "sourceEnd": 91.0,
+        "sourceStart": 85.0
+    },
+    {
+        "scene": 12,
+        "narration": "Ba kỹ thuật này khai sinh kỷ nguyên mới của coding agents.",
+        "sourceEnd": 96.0,
+        "sourceStart": 91.0
+    },
+    {
+        "scene": 13,
+        "narration": "Cursor... Windsurf... Cline... Roo... Aider... đều dùng tool calling cho context engineering.",
+        "display": "Cursor, Windsurf, Cline, Roo, Aider đều dùng tool calling cho context engineering.",
+        "sourceEnd": 101.0,
+        "sourceStart": 95.0
+    },
+    {
+        "scene": 14,
+        "narration": "Đây là những công cụ mạnh và làm việc rất tốt.",
+        "sourceEnd": 107.0,
+        "sourceStart": 101.0
+    },
+    {
+        "scene": 15,
+        "narration": "Đồng thời, context window của model ngày càng mở rộng.",
+        "sourceEnd": 115.0,
+        "sourceStart": 107.0
+    },
+    {
+        "scene": 16,
+        "narration": "Coding agents bắt đầu xử lý task dài, phạm vi lớn hơn.",
+        "display": "Coding agents bắt đầu xử lý task dài, scope lớn hơn.",
+        "sourceEnd": 122.0,
+        "sourceStart": 116.0
+    },
+    {
+        "scene": 17,
+        "narration": "Người dùng giao tính năng, bug fix với quy mô ngày càng lớn.",
+        "sourceEnd": 126.0,
+        "sourceStart": 120.0
+    },
+    {
+        "scene": 18,
+        "narration": "Context engineering tự động load context giúp agents xử lý task phức tạp.",
+        "sourceEnd": 134.0,
+        "sourceStart": 126.0
+    },
+    {
+        "scene": 19,
+        "narration": "Nhưng khi task dài hơn, điều này cũng có giới hạn.",
+        "sourceEnd": 143.0,
+        "sourceStart": 137.0
+    },
+    {
+        "scene": 20,
+        "narration": "Càng giao task dài hơn, prompt engineering đơn giản càng thất bại.",
+        "sourceEnd": 149.0,
+        "sourceStart": 143.0
+    },
+    {
+        "scene": 21,
+        "narration": "Clone cả một website chỉ bằng một prompt, kết quả cực kỳ sơ sài.",
+        "sourceEnd": 153.0,
+        "sourceStart": 149.0
+    },
+    {
+        "scene": 22,
+        "narration": "Context engineering cũng không giải quyết được khi phạm vi quá lớn.",
+        "display": "Context engineering cũng không giải quyết được khi scope quá lớn.",
+        "sourceEnd": 159.0,
+        "sourceStart": 153.0
+    },
+    {
+        "scene": 23,
+        "narration": "Website làm dở, nút bấm không hoạt động, tính năng chưa được test.",
+        "sourceEnd": 169.0,
+        "sourceStart": 163.0
+    },
+    {
+        "scene": 24,
+        "narration": "Vấn đề chính: agent dùng context summarization để thu nhỏ context khi sắp đầy.",
+        "sourceEnd": 178.0,
+        "sourceStart": 171.0
+    },
+    {
+        "scene": 25,
+        "narration": "Task kéo 12 tiếng, context window đầy thì agent tóm tắt lại rồi tiếp tục.",
+        "sourceEnd": 188.0,
+        "sourceStart": 181.0
+    },
+    {
+        "scene": 26,
+        "narration": "Agent bị giới hạn bởi chính khả năng tóm tắt công việc của mình.",
+        "sourceEnd": 200.0,
+        "sourceStart": 193.0
+    },
+    {
+        "scene": 27,
+        "narration": "Hậu quả là task bị bỏ dở nửa chừng hoặc không được thực hiện.",
+        "sourceEnd": 205.0,
+        "sourceStart": 200.0
+    },
+    {
+        "scene": 28,
+        "narration": "Agent còn tự nghĩ task đã xong hoặc bỏ qua tính năng chưa làm.",
+        "sourceEnd": 212.0,
+        "sourceStart": 205.0
+    },
+    {
+        "scene": 29,
+        "narration": "Agent tự quản lý context window thường đơn giản hóa task, giả định công việc đã xong khi chưa thực sự vậy.",
+        "sourceEnd": 218.0,
+        "sourceStart": 214.2
+    },
+    {
+        "scene": 30,
+        "narration": "Cách này tạo ảo giác xử lý được task dài hơn, nhưng thực tế không hiệu quả.",
+        "sourceEnd": 224.0,
+        "sourceStart": 218.0
+    },
+    {
+        "scene": 31,
+        "narration": "Người ta thử dùng sub-agent để quản lý context theo bậc, hoặc triển khai swarm nhiều agent.",
+        "sourceEnd": 240.0,
+        "sourceStart": 233.0
+    },
+    {
+        "scene": 32,
+        "narration": "Tất cả đang hội tụ về harness agent, cần orchestration layer, execution environment, và context management tốt hơn.",
+        "sourceEnd": 258.0,
+        "sourceStart": 251.0
+    },
+    {
+        "scene": 33,
+        "narration": "Khái niệm agent harness ra đời và được đặt tên chính thức vào đầu năm 2026.",
+        "sourceEnd": 270.0,
+        "sourceStart": 263.0
+    },
+    {
+        "scene": 34,
+        "narration": "Dù có vẻ là buzzword, harnessing phản ánh sự chuyển đổi quan trọng đang xảy ra trong AI.",
+        "sourceEnd": 277.0,
+        "sourceStart": 271.0
+    },
+    {
+        "scene": 35,
+        "narration": "Vậy câu hỏi đặt ra: agent harness thực sự khác gì so với những gì đã có trước?",
+        "sourceEnd": 284.4,
+        "sourceStart": 280.0
+    },
+    {
+        "scene": 36,
+        "narration": "Khi website thiếu thông tin model mới, bạn không cần sửa thủ công, chỉ cần spawn một agent và nó tự xử lý.",
+        "sourceEnd": 306.8,
+        "sourceStart": 299.7
+    },
+    {
+        "scene": 37,
+        "narration": "Trong khi đó, bạn có thể spawn thêm nhiều agent khác chạy song song, mỗi cái có context riêng để xử lý các tính năng khác nhau.",
+        "sourceEnd": 318.5,
+        "sourceStart": 309.9
+    },
+    {
+        "scene": 38,
+        "narration": "Nâng lên một bậc: cloud agent cho phép bạn đóng máy hoàn toàn, agent vẫn chạy trên cloud và tự tạo pull request khi xong.",
+        "sourceEnd": 331.9,
+        "sourceStart": 320.5
+    },
+    {
+        "scene": 39,
+        "narration": "Tích hợp thêm Slack: gửi feature request qua Slack là cloud agent tự kích hoạt, làm xong thì ping lại kèm PR.",
+        "sourceEnd": 341.9,
+        "sourceStart": 333.9
+    },
+    {
+        "scene": 40,
+        "narration": "Đỉnh cao nhất: vận hành hoàn toàn tự động, agent tự kiểm tra model mới mỗi ngày và giữ website luôn cập nhật mà không cần bạn làm gì.",
+        "sourceEnd": 356.9,
+        "sourceStart": 343.9
+    },
+    {
+        "scene": 41,
+        "narration": "Thay đổi lớn nhất của Harness Engineering là khái niệm loops.",
+        "sourceEnd": 362.6,
+        "sourceStart": 357.1
+    },
+    {
+        "scene": 42,
+        "narration": "Agent chạy trong vòng lặp, mỗi vòng có context mới, sạch, dưới quy tắc cố định về cách bắt đầu và kết thúc nhiệm vụ.",
+        "sourceEnd": 368.4,
+        "sourceStart": 362.6
+    },
+    {
+        "scene": 43,
+        "narration": "Môi trường này tạo ra kết quả ấn tượng.",
+        "sourceEnd": 381.7,
+        "sourceStart": 373.7
+    },
+    {
+        "scene": 44,
+        "narration": "Ví dụ tiêu biểu là RAL, lan truyền mạnh nhờ hiệu quả cao và kiến trúc cực đơn giản.",
+        "sourceEnd": 388.0,
+        "sourceStart": 381.7
+    },
+    {
+        "scene": 45,
+        "narration": "Harness Engineering không thay thế context engineering hay prompt engineering.",
+        "sourceEnd": 397.0,
+        "sourceStart": 390.3
+    },
+    {
+        "scene": 46,
+        "narration": "Các coding agent open source như Klein vẫn dựa vào system prompt được viết kỹ lưỡng.",
+        "sourceEnd": 406.7,
+        "sourceStart": 399.0
+    },
+    {
+        "scene": 47,
+        "narration": "Prompt engineering vẫn dùng, nhưng chỉ là một phần nhỏ trong hệ thống lớn hơn.",
+        "sourceEnd": 413.2,
+        "sourceStart": 406.7
+    },
+    {
+        "scene": 48,
+        "narration": "Prompt engineering xác định persona cho agent, nhắc nó biết mình là coding agent.",
+        "sourceEnd": 419.6,
+        "sourceStart": 413.2
+    },
+    {
+        "scene": 49,
+        "narration": "Phía trên là context engineering. Harness Engineering tận dụng cả hai, đây là sự thay đổi mô hình.",
+        "sourceEnd": 428.3,
+        "sourceStart": 423.3
+    },
+    {
+        "scene": 50,
+        "narration": "Agent hoạt động trong chuỗi bước có cấu trúc.",
+        "sourceEnd": 434.0,
+        "sourceStart": 428.0
+    },
+    {
+        "scene": 51,
+        "narration": "Đầu tiên sinh fai requirement, rồi vòng lặp chọn từng task để thực hiện.",
+        "display": "Đầu tiên sinh file requirement, rồi vòng lặp chọn từng task để thực hiện.",
+        "sourceEnd": 445.0,
+        "sourceStart": 438.0
+    },
+    {
+        "scene": 52,
+        "narration": "Agent kiểm thử và ghi lại từng bước cho đến khi toàn bộ task hoàn tất.",
+        "sourceEnd": 453.0,
+        "sourceStart": 445.0
+    },
+    {
+        "scene": 53,
+        "narration": "Mỗi vòng lặp, agent nhận prompt và context hoàn toàn mới.",
+        "sourceEnd": 458.0,
+        "sourceStart": 453.0
+    },
+    {
+        "scene": 54,
+        "narration": "Ralph's documentation cũng theo mô hình này: tạo requirement document, xuất JSON, rồi loop từng feature.",
+        "sourceEnd": 470.0,
+        "sourceStart": 462.0
+    },
+    {
+        "scene": 55,
+        "narration": "Kiến trúc này rất nhỏ gọn, repo Ralph và demo Anthropic đều lightweight, đơn giản.",
+        "sourceEnd": 477.0,
+        "sourceStart": 470.0
+    },
+    {
+        "scene": 56,
+        "narration": "Nhiều coding agent đã tích hợp harnessing layer trực tiếp vào ứng dụng theo cách riêng.",
+        "sourceEnd": 492.0,
+        "sourceStart": 484.0
+    },
+    {
+        "scene": 57,
+        "narration": "Đó là lý do nhiều công ty nói về harnessing layer, vì nó thực sự hiệu quả.",
+        "sourceEnd": 499.91,
+        "sourceStart": 494.0
+    }
+]

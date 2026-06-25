@@ -1,0 +1,37 @@
+{
+  "name": "GameStory — starter (DB connectivity)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "b1a1f000-0000-4000-8000-000000000001",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [340, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT p.id, p.name, p.status, p.language,\n       (SELECT count(*) FROM videos v WHERE v.page_id = p.id) AS videos,\n       (SELECT count(*) FROM jobs j WHERE j.page_id = p.id AND j.status IN ('queued','running')) AS pending_jobs\n  FROM pages p\n ORDER BY p.id;",
+        "options": {}
+      },
+      "id": "b1a1f000-0000-4000-8000-000000000002",
+      "name": "Read pages (real DB)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [620, 300],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "name": "ContentFactory Postgres"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [[{ "node": "Read pages (real DB)", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" }
+}

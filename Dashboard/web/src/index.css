@@ -1,0 +1,181 @@
+@import "tailwindcss";
+
+/* Class/attribute-based dark mode driven by [data-theme="dark"] on <html>. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/*
+  "Midnight Console" — a near-black bento palette (dark is the primary look).
+  Token names are kept stable; only their values change, so existing
+  utility classes (bg-ink, bg-panel, text-fg, text-brand, ...) keep working.
+    ink    = near-black page background (cool charcoal, never pure #000)
+    panel  = card surface (a hair lighter than the page)
+    panel2 = raised chips / segmented controls / secondary surface
+    line   = hairline borders (low-opacity light edge)
+    fg     = primary near-white text
+    muted  = secondary cool-gray text
+    brand  = single confident accent — a clean electric blue (no purple AI gradient)
+
+  Light mode (the [data-theme="light"] override) stays a coherent cool gray
+  so the two themes share one hue family.
+*/
+@theme {
+  --color-ink: #08090c;
+  --color-panel: #121318;
+  --color-panel2: #1c1e26;
+  --color-line: #262934;
+  --color-brand: #4d8bff;
+  --color-brand2: #79a9ff;
+  --color-muted: #8b8f9c;
+  --color-fg: #f3f4f7;
+  --font-sans: "Montserrat Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 1px 2px rgba(0, 0, 0, 0.45), 0 18px 40px -22px rgba(2, 8, 26, 0.9);
+}
+
+/*
+  Light mode — a cool, low-glare gray sharing the same blue accent so the
+  two themes feel like one system. Only the token values change.
+*/
+[data-theme="light"] {
+  --color-ink: #f4f5f8;
+  --color-panel: #ffffff;
+  --color-panel2: #eef0f5;
+  --color-line: #e2e5ec;
+  --color-brand: #2f6bff;
+  --color-brand2: #6a97ff;
+  --color-muted: #636979;
+  --color-fg: #131722;
+  --shadow-card: inset 0 1px 0 rgba(255, 255, 255, 0.6), 0 1px 2px rgba(20, 27, 45, 0.05), 0 6px 20px -10px rgba(30, 50, 110, 0.16);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  position: relative;
+  background-color: var(--color-ink);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* Cool blue ambient glow — echoes the reference's luminous orb so the
+     page is never a flat slab of one color. (dark is the base case) */
+  background-image:
+    radial-gradient(1100px 620px at 86% -12%, rgba(77, 139, 255, 0.16), transparent 60%),
+    radial-gradient(840px 520px at -6% 6%, rgba(60, 110, 255, 0.1), transparent 55%);
+  background-attachment: fixed;
+}
+
+[data-theme="light"] body {
+  background-image:
+    radial-gradient(1200px 600px at 88% -8%, rgba(47, 107, 255, 0.08), transparent 60%),
+    radial-gradient(900px 500px at -5% 0%, rgba(106, 151, 255, 0.06), transparent 55%);
+}
+
+/* Fixed, ultra-subtle grain so dark surfaces read as material, not flat vector. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.035;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+[data-theme="light"] body::before {
+  opacity: 0.02;
+}
+
+#root {
+  position: relative;
+  z-index: 1;
+}
+
+/* Tighter, more intentional display type. */
+h1,
+h2,
+h3 {
+  letter-spacing: -0.018em;
+  text-wrap: balance;
+}
+
+/* Single, consistent keyboard focus treatment. */
+:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/*
+  Global pointer-cursor policy.
+
+  Every natively-interactive element gets the hand cursor on hover so the UI
+  reads as clickable without per-component patching. This covers existing AND
+  future components. Tailwind's preflight resets <button>/<select> to the
+  default arrow cursor, so this rule (in @layer base, after preflight which is
+  in the same base layer) intentionally restores `pointer` for them.
+
+  NOTE: React `onClick` on a <div>/<span> renders NO DOM attribute, so a pure
+  CSS selector cannot target those. Those cases are handled in the components
+  themselves: clickable divs carry either role="button" (matched below) or an
+  explicit `cursor-pointer` Tailwind class.
+*/
+@layer base {
+  button,
+  [role="button"],
+  summary,
+  label[for],
+  select,
+  a[href],
+  input[type="checkbox"],
+  input[type="radio"],
+  input[type="submit"],
+  input[type="button"],
+  input[type="reset"] {
+    cursor: pointer;
+  }
+
+  /* Disabled / non-interactive states win over the pointer rule above.
+     Listed after it and with equal-or-higher specificity so it overrides. */
+  button:disabled,
+  select:disabled,
+  input:disabled,
+  textarea:disabled,
+  [aria-disabled="true"],
+  .disabled {
+    cursor: not-allowed;
+  }
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line) transparent;
+}
+
+/* Gentle, weighty entry — applied on view change. transform/opacity only. */
+@keyframes cf-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.animate-rise {
+  animation: cf-rise 520ms cubic-bezier(0.32, 0.72, 0, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-rise {
+    animation: none;
+  }
+}

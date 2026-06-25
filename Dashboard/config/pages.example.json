@@ -1,0 +1,23 @@
+{
+  "_comment": "Registry example for the `pages` table. Creator/credit fields belong to the project owner and must be filled by the user, not inferred from the borrowed Claude account. Production options (render_mode, voice, render_model, etc.) are chosen per-job at video creation time — not stored on the page.",
+  "pages": [
+    {
+      "name": "GameStory",
+      "language": "vi",
+      "status": "active",
+      "creator_name": "TODO_ASK_USER",
+      "author": "TODO_ASK_USER",
+      "credit": "TODO_ASK_USER",
+      "channel_url": "TODO_ASK_USER",
+      "_accounts_comment": "ISOLATION: each page uses its OWN account per platform so one ban does not cascade. Personal Gmail is enough for YouTube; Instagram requires a Business/Creator account. Never put raw secrets here — credentials_ref points to a gitignored token file.",
+      "platform_accounts": [
+        {
+          "platform": "youtube",
+          "account_label": "contentfactory.gamestory@gmail.com",
+          "account_type": "personal",
+          "credentials_ref": "Dashboard/secrets/GameStory/youtube.json"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+# Secrets — OAuth tokens, API keys, service-account JSON. NEVER commit.
+Dashboard/secrets/
+**/secrets/
+*.token.json
+*.credentials.json
+.env
+
+# Generated media (large, regenerable)
+GameStory/assets/*
+GameStory/output/*
+GameStory/scripts/*.json
+!**/.gitkeep
+
+# Scratch / session artifacts
+_workspace_prev/
+
+# Python / tooling
+__pycache__/
+*.pyc
+.venv/
+venv/

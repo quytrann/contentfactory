@@ -1,0 +1,11 @@
+fastapi>=0.115,<0.116
+uvicorn[standard]>=0.32,<0.33
+psycopg[binary]>=3.2,<3.3
+python-dotenv>=1.0,<2.0
+python-multipart>=0.0.9,<0.1          # UploadFile (voice/image uploads)
+
+# YouTube publish step (youtube_upload.py / youtube_auth.py). Free (Apache-2.0).
+# The owner still runs the one-time OAuth consent flow to create the token.
+google-api-python-client>=2.0,<3.0
+google-auth-oauthlib>=1.2,<2.0
+google-auth-httplib2>=0.2,<0.3
