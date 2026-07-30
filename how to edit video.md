@@ -5,10 +5,14 @@ avoid plain reuploads, every video should **transform** the source, not just
 re-voice it. Pick one of the editing modes below, then apply the safety
 formula in section 6.
 
-The modes are: **Commentary**, **Recap**, **Educational**, **Summary**, and
-**Dubbed**. The first four are genuine-transformation modes. **Dubbed** is a
-high-risk, owner-accepted exception (keep original A/V + subtitles only) — see
-section 5; it is not a default and is the closest mode to a plain reupload.
+The modes are: **Commentary**, **Recap**, **Educational**, **Summary**,
+**Dubbed**, and **Translate-full**. The first four are genuine-transformation
+modes. **Dubbed** and **Translate-full** are high-risk, owner-accepted
+exceptions that keep 100% of the source content — see sections 5 and 6. Neither
+is a default, and both are the closest modes to a plain reupload: Dubbed keeps
+the original audio + subtitles only, while Translate-full re-voices the source in
+**natural** Vietnamese (voiceover + subtitles), keeping **100% of its content**
+and cutting only junk — a full localization, not a genuine transform.
 
 ## 1. Commentary (analysis + opinion)
 
@@ -120,7 +124,89 @@ source_link), and the creator/credit fields belong to the project owner
 monetization-eligible on any platform is region- and time-dependent and must be
 verified with the researcher before any such claim is made.
 
-## 6. The "safer" formula (very important)
+## 6. Mode 6: Translate-full (high risk, owner-accepted exception) — `translate_full` mode
+
+**Idea** — A **full localization** of the source: re-tell the **entire** video in
+**natural spoken Vietnamese**, keeping **100% of the substantive content** (every
+point, fact, and example, in the original order) but **cutting the junk** (ads,
+sponsor reads, the source's own credit/attribution/watermark call-outs, bloated
+intros/outros). Keep the source **video** on screen (audio muted), speak the
+Vietnamese narration over it, and burn Vietnamese subtitles from the same text.
+
+> **Design note (changed 2026-07):** Translate-full used to do a **1:1 literal,
+> time-locked** translation — one Vietnamese line per source segment, each pinned
+> to that segment's time window. That forced an **unnatural, slow** read (the voice
+> had to stretch or rush to fit each source segment). It now generates the script
+> the **same way `summary`/footage does** — natural, comfortably-paced Vietnamese
+> narration in free-standing scenes with their own source windows — **but keeps ALL
+> the content** instead of condensing. It is no longer literal and no longer
+> time-locked to the source segments.
+
+**What it does (and does not) do:**
+- Generates a **natural-narration** script (like Summary), NOT a literal
+  line-by-line translation and NOT locked to each source segment's timing — the raw
+  transcript's choppy phrasing is rewritten into smooth, comfortably-paced Vietnamese.
+- Keeps **100% of the substantive content** — comprehensive coverage of every point,
+  fact, argument, example, and number, in the **original order**. This full retention
+  is exactly what separates it from **Summary/Recap**, which *condense* and (for
+  Recap) *re-sequence*. Translate-full never drops or compresses real content.
+- **Cuts only junk** — the narration (and therefore the scenes' source windows) skips
+  ads, sponsor reads, like/subscribe/follow prompts, the original channel's
+  self-promotion, source **credit / attribution / watermark** segments, and bloated or
+  repeated intros/outros. It never cuts real content.
+- Keeps the source **video** on screen (source's own picture), **mutes** the source
+  audio, produces a Vietnamese **voiceover** (F5-TTS), and burns **per-word karaoke**
+  Vietnamese subtitles positioned over the cover band (with EasyOCR caption-cover of
+  any burned-in source captions and a subtle Ken Burns zoom).
+- Pace is a fixed, natural speaking rate — the voice is **never** sped up or crammed
+  to fit; length follows the content (all of it) minus the junk.
+
+**How it differs from the safer transform modes** — Commentary / Recap /
+Educational / Summary all *reduce or re-angle* the source: they add the creator's own
+voice as the main content (> 60–80%), reorder, analyze, or condense, and keep the
+original footage as illustration only. Translate-full does **none** of that: it keeps
+the whole source video and re-voices **all** of its content in Vietnamese. The only
+thing it removes is junk.
+
+**How it differs from Summary** — Summary and Translate-full now build the script the
+**same way** (natural narration, free scenes). The difference is **retention**:
+Summary *condenses* (keep ~76–90%, trim redundant/slow real content to hit a shorter
+length); Translate-full *keeps everything substantive* (100% of the content, only junk
+removed). If you want the video shorter than the source, use Summary; if you want the
+whole thing localized, use Translate-full.
+
+**How it differs from Dubbed** — Both keep the full source content. Dubbed keeps the
+**original spoken audio** (subtitles only, no voiceover, no TTS, no rewriting).
+Translate-full **mutes** the audio and adds a natural Vietnamese TTS **voiceover** +
+subtitles. Dubbed is closest to "the source with subtitles"; Translate-full is closest
+to "the source, re-narrated end to end in natural Vietnamese."
+
+**Why it is flagged high-risk** — Translate-full is **NOT** covered by the
+">60-80% your own voice" transformation safety formula in section 7. Making the
+narration *natural* does not change that: it still delivers **all** of someone else's
+content, in order, over their own footage — a **full localization / reupload with a
+Vietnamese soundtrack**, not a transform. It carries the **highest copyright /
+reupload risk** alongside Dubbed, and reaches more of the source than any transform
+mode because it re-voices the entire thing. Cutting junk does not make it
+transformative.
+
+**Status** — Owner-accepted exception only, chosen deliberately per job. It is not a
+default and must not stand in for a genuine-transformation mode when Recap / Summary
+/ Commentary would serve. Source credit at the end of the video is **mandatory**
+(`source_name` / `source_link`); the creator/credit fields belong to the project
+owner (`TODO_ASK_USER` if unknown), never inferred from the logged-in account.
+
+**Monetization** — Not asserted here. Whether a full-translation reupload is
+monetization-eligible on any platform is region- and time-dependent and must be
+verified with the researcher before any such claim is made. Treat it as **at least
+as risky as Dubbed** for eligibility purposes.
+
+**When to use** — Only when the owner explicitly wants the entire source delivered
+in Vietnamese with a spoken voiceover (not just subtitles), accepts the reupload
+risk, and no transform mode is wanted. For anything meant to be safely monetizable,
+prefer Recap / Summary / Commentary.
+
+## 7. The "safer" formula (very important)
 
 You should guarantee:
 
@@ -132,7 +218,7 @@ You should guarantee:
 4. **No verbatim reupload** — avoid: re-uploading the full video, only changing the
    language, or only trimming it.
 
-## 7. Niches that are easy to make & monetize
+## 8. Niches that are easy to make & monetize
 
 - Drama / internet story (with analysis)
 - True crime recap
@@ -141,7 +227,7 @@ You should guarantee:
 - Everyday psychology
 - Facts / mysteries / pop science
 
-## 8. Example of a good video format
+## 9. Example of a good video format
 
 - **Hook (3–5s):** "This story seems simple, but it has a twist that's hard to believe…"
 - **Story recap (30–60%):** retell it concisely.

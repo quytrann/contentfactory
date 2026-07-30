@@ -1,0 +1,37 @@
+# cf-venv worker dependencies (E:\Installed\cf-venv) — NOT the API venv.
+#
+# The cf-venv hosts the GPU/CPU worker subprocesses: faster-whisper, F5-TTS,
+# VieNeu, yt-dlp ingest/download, and (for the translate_full edit_mode) the
+# caption-cover DETECTOR (workers/caption_cover.py -> EasyOCR + OpenCV).
+#
+# This file documents ONLY the deps the workers need on top of a working CUDA
+# torch stack. It is a note, not an automated install target — install into the
+# EXISTING cf-venv, do NOT create a fresh one (that would drop the CUDA torch/F5/
+# whisper install already there).
+#
+# ---------------------------------------------------------------------------
+# caption_cover.py (translate_full) — burned-caption detection
+# ---------------------------------------------------------------------------
+# easyocr pulls torch as a dependency. If torch is not already satisfied, a bare
+# `pip install easyocr` installs the CPU-only torch wheel from PyPI, which SILENTLY
+# REPLACES the cu121 CUDA torch — breaking CUDA for F5-TTS AND faster-whisper.
+#
+# ALWAYS install easyocr TOGETHER WITH the cu121 torch pin, from the cu121 index,
+# so pip never downgrades torch to the CPU wheel:
+#
+#   E:\Installed\cf-venv\Scripts\python.exe -m pip install ^
+#     easyocr ^
+#     torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 ^
+#     --extra-index-url https://download.pytorch.org/whl/cu121
+#
+# Verify AFTER install (must print True):
+#   E:\Installed\cf-venv\Scripts\python.exe -c "import torch; print(torch.cuda.is_available())"
+#
+# Do NOT reinstall torch if CUDA already works — check torch.cuda.is_available()
+# FIRST. Only run the command above (with the pin) if easyocr is missing or torch
+# got downgraded to a CPU build.
+easyocr
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+torchaudio==2.5.1+cu121
+# opencv-python is an easyocr dependency (cv2), pulled in automatically.

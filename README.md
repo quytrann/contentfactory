@@ -39,7 +39,6 @@ ContentFactory/
 ├── tools/
 │   └── voice_doctor.py     TTS/audio diagnostics tool
 ├── .claude/                Claude Code agent & skill definitions
-├── areach.ps1              Agent Reach wrapper (web research)
 ├── CLAUDE.md               Primary project instructions for Claude Code
 ├── how to edit video.md    Editing-mode playbook (commentary/recap/educational/summary/dubbed)
 ├── project_define.md       Owner's original project definition
@@ -92,7 +91,7 @@ See [how to edit video.md](how%20to%20edit%20video.md) for the full transformati
 | Image generation | ComfyUI + SDXL |
 | Video assembly | FFmpeg (Python microservice) |
 | Stickman render | Procedural 2D / Blender headless |
-| Web research | Agent Reach (`areach.ps1` wrapper) |
+| Web research | yt-dlp + WebSearch/WebFetch |
 | Publishing | YouTube Data API v3 → IG / TikTok / FB |
 
 ## Getting started

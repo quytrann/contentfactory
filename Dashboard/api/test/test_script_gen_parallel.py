@@ -57,7 +57,7 @@ class _ConcurrencyTracker:
         self.peak = 0
         self.calls = 0
 
-    def __call__(self, prompt, timeout=None):
+    def __call__(self, prompt, timeout=None, cache_parts=None, batch_idx=0):
         with self._lock:
             self.in_flight += 1
             self.calls += 1
@@ -162,7 +162,7 @@ class _ReverseFinishStub:
         assert m is not None, "prompt missing #BATCHIDX=..# marker"
         return int(m.group(1))
 
-    def __call__(self, prompt, timeout=None):
+    def __call__(self, prompt, timeout=None, cache_parts=None, batch_idx=0):
         i = self._index_of(prompt)
         # Earlier index -> longer sleep -> finishes later in REVERSE of submit order.
         time.sleep((self.n_batches - i) * self.unit_sleep)
@@ -218,7 +218,7 @@ def test_gen_footage_scenes_multibatch_preserves_order(monkeypatch):
     # index in build order (footage builds prompts sequentially before submitting).
     counter = {"i": 0}
 
-    def _fake_build(req, n_scenes, window, window_start=0.0, ratio_nudge=None):
+    def _fake_build(req, n_scenes, window, window_start=0.0, ratio_nudge=None, total_window=None):
         i = counter["i"]
         counter["i"] += 1
         return f"#BATCHIDX={i}# footage n={n_scenes} ws={window_start} we={window}"
@@ -304,7 +304,7 @@ def _make_failing_stub(fail_index, exc):
     fail-fast propagation with no partial merge."""
     import re
 
-    def _stub(prompt, timeout=None):
+    def _stub(prompt, timeout=None, cache_parts=None, batch_idx=0):
         m = re.search(r"#BATCHIDX=(\d+)#", prompt)
         i = int(m.group(1)) if m else 0
         if i == fail_index:
@@ -353,7 +353,7 @@ def test_gen_footage_scenes_multibatch_fails_fast_no_partial_merge(monkeypatch):
 
     counter = {"i": 0}
 
-    def _fake_build(req, n_scenes, window, window_start=0.0, ratio_nudge=None):
+    def _fake_build(req, n_scenes, window, window_start=0.0, ratio_nudge=None, total_window=None):
         i = counter["i"]
         counter["i"] += 1
         return f"#BATCHIDX={i}# footage"

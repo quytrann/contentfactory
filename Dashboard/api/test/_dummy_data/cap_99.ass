@@ -1,0 +1,77 @@
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 2
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Be Vietnam Pro,100,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,5,2,2,39,39,240,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:00.40,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(204,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(350,400,\c&HFFFFFF&\fscx100\fscy100)}Trong
+Dialogue: 0,0:00:00.40,0:00:02.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(204,1680)}Trong
+Dialogue: 1,0:00:00.00,0:00:00.40,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(394,1680)}một
+Dialogue: 1,0:00:00.40,0:00:00.80,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(394,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(350,400,\c&HFFFFFF&\fscx100\fscy100)}một
+Dialogue: 1,0:00:00.80,0:00:02.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(394,1680)}một
+Dialogue: 2,0:00:00.00,0:00:00.80,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(525,1680)}hệ
+Dialogue: 2,0:00:00.80,0:00:01.20,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(525,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(349,399,\c&HFFFFFF&\fscx100\fscy100)}hệ
+Dialogue: 2,0:00:01.20,0:00:02.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(525,1680)}hệ
+Dialogue: 3,0:00:00.00,0:00:01.20,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(688,1680)}thống
+Dialogue: 3,0:00:01.20,0:00:01.60,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(688,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(350,400,\c&HFFFFFF&\fscx100\fscy100)}thống
+Dialogue: 3,0:00:01.60,0:00:02.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(688,1680)}thống
+Dialogue: 4,0:00:00.00,0:00:01.60,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(892,1680)}phức
+Dialogue: 4,0:00:01.60,0:00:02.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(892,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(349,399,\c&HFFFFFF&\fscx100\fscy100)}phức
+Dialogue: 7,0:00:02.00,0:00:02.40,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(205,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(349,399,\c&HFFFFFF&\fscx100\fscy100)}tạp
+Dialogue: 7,0:00:02.40,0:00:04.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(205,1680)}tạp
+Dialogue: 8,0:00:02.00,0:00:02.40,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(338,1680)}với
+Dialogue: 8,0:00:02.40,0:00:02.80,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(338,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(349,399,\c&HFFFFFF&\fscx100\fscy100)}với
+Dialogue: 8,0:00:02.80,0:00:04.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(338,1680)}với
+Dialogue: 9,0:00:02.00,0:00:02.80,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(463,1680)}rất
+Dialogue: 9,0:00:02.80,0:00:03.20,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(463,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(350,400,\c&HFFFFFF&\fscx100\fscy100)}rất
+Dialogue: 9,0:00:03.20,0:00:04.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(463,1680)}rất
+Dialogue: 10,0:00:02.00,0:00:03.20,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(627,1680)}nhiều
+Dialogue: 10,0:00:03.20,0:00:03.60,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(627,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(349,399,\c&HFFFFFF&\fscx100\fscy100)}nhiều
+Dialogue: 10,0:00:03.60,0:00:04.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(627,1680)}nhiều
+Dialogue: 11,0:00:02.00,0:00:03.60,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(837,1680)}thành
+Dialogue: 11,0:00:03.60,0:00:04.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(837,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(349,399,\c&HFFFFFF&\fscx100\fscy100)}thành
+Dialogue: 14,0:00:04.00,0:00:04.40,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(216,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(350,400,\c&HFFFFFF&\fscx100\fscy100)}phần
+Dialogue: 14,0:00:04.40,0:00:06.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(216,1680)}phần
+Dialogue: 15,0:00:04.00,0:00:04.40,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(404,1680)}khác
+Dialogue: 15,0:00:04.40,0:00:04.80,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(404,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(349,399,\c&HFFFFFF&\fscx100\fscy100)}khác
+Dialogue: 15,0:00:04.80,0:00:06.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(404,1680)}khác
+Dialogue: 16,0:00:04.00,0:00:04.80,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(590,1680)}nhau
+Dialogue: 16,0:00:04.80,0:00:05.20,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(590,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(350,400,\c&HFFFFFF&\fscx100\fscy100)}nhau
+Dialogue: 16,0:00:05.20,0:00:06.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(590,1680)}nhau
+Dialogue: 17,0:00:04.00,0:00:05.20,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(739,1680)}thì
+Dialogue: 17,0:00:05.20,0:00:05.60,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(739,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(349,399,\c&HFFFFFF&\fscx100\fscy100)}thì
+Dialogue: 17,0:00:05.60,0:00:06.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(739,1680)}thì
+Dialogue: 18,0:00:04.00,0:00:05.60,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(876,1680)}việc
+Dialogue: 18,0:00:05.60,0:00:06.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(876,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(349,399,\c&HFFFFFF&\fscx100\fscy100)}việc
+Dialogue: 21,0:00:06.00,0:00:06.40,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(204,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(350,400,\c&HFFFFFF&\fscx100\fscy100)}điều
+Dialogue: 21,0:00:06.40,0:00:08.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(204,1680)}điều
+Dialogue: 22,0:00:06.00,0:00:06.40,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(375,1680)}phối
+Dialogue: 22,0:00:06.40,0:00:06.80,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(375,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(349,399,\c&HFFFFFF&\fscx100\fscy100)}phối
+Dialogue: 22,0:00:06.80,0:00:08.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(375,1680)}phối
+Dialogue: 23,0:00:06.00,0:00:06.80,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(575,1680)}chúng
+Dialogue: 23,0:00:06.80,0:00:07.20,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(575,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(350,400,\c&HFFFFFF&\fscx100\fscy100)}chúng
+Dialogue: 23,0:00:07.20,0:00:08.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(575,1680)}chúng
+Dialogue: 24,0:00:06.00,0:00:07.20,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(752,1680)}trở
+Dialogue: 24,0:00:07.20,0:00:07.60,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(752,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(349,399,\c&HFFFFFF&\fscx100\fscy100)}trở
+Dialogue: 24,0:00:07.60,0:00:08.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(752,1680)}trở
+Dialogue: 25,0:00:06.00,0:00:07.60,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(887,1680)}nên
+Dialogue: 25,0:00:07.60,0:00:08.00,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(887,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(349,399,\c&HFFFFFF&\fscx100\fscy100)}nên
+Dialogue: 28,0:00:08.00,0:00:08.40,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(161,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(350,400,\c&HFFFFFF&\fscx100\fscy100)}vô
+Dialogue: 28,0:00:08.40,0:00:10.40,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(161,1680)}vô
+Dialogue: 29,0:00:08.00,0:00:08.40,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(308,1680)}cùng
+Dialogue: 29,0:00:08.40,0:00:08.80,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(308,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(350,400,\c&HFFFFFF&\fscx100\fscy100)}cùng
+Dialogue: 29,0:00:08.80,0:00:10.40,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(308,1680)}cùng
+Dialogue: 30,0:00:08.00,0:00:08.80,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(496,1680)}quan
+Dialogue: 30,0:00:08.80,0:00:09.20,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(496,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(349,399,\c&HFFFFFF&\fscx100\fscy100)}quan
+Dialogue: 30,0:00:09.20,0:00:10.40,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(496,1680)}quan
+Dialogue: 31,0:00:08.00,0:00:09.20,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(694,1680)}trọng
+Dialogue: 31,0:00:09.20,0:00:09.60,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(694,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(350,400,\c&HFFFFFF&\fscx100\fscy100)}trọng
+Dialogue: 31,0:00:09.60,0:00:10.40,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(694,1680)}trọng
+Dialogue: 32,0:00:08.00,0:00:09.60,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(884,1680)}đấy.
+Dialogue: 32,0:00:09.60,0:00:10.40,Default,,0,0,0,,{\c&HFFFFFF&\an2\pos(884,1680)\fscx100\fscy100\t(0,50,\c&H00FFFF&\fscx110\fscy110)\t(749,799,\c&HFFFFFF&\fscx100\fscy100)}đấy.

@@ -7,10 +7,14 @@ from mock data to live data without reshaping. Everything is read-only for now.
 Run:  uvicorn main:app --host 127.0.0.1 --port 4000
 """
 
+import asyncio
 import ctypes
 import json
 import os
+import shutil
 import subprocess
+import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -19,25 +23,38 @@ from urllib.parse import quote
 import psycopg
 from psycopg.types.json import Json
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# Load .env BEFORE importing project modules. Several of them read env vars at IMPORT
+# time (notably generate.py's `CLAUDE_BIN = os.getenv("CLAUDE_BIN", "claude")`), so if
+# .env is not already in os.environ they silently freeze to their defaults — and a
+# later load_dotenv() cannot fix an already-evaluated module global. That exact bug
+# made every script-gen fail with "Claude binary not found: claude".
+load_dotenv()
+
+import generate  # module handle for batch probe + VI title translation reuse
+import llm_gate  # provider gate: backs GET /api/llm/models (catalogue + 6h disk cache)
 import render_cache
 import tts_cache
 from platform_specs import get_platform_specs
 from db import get_conn
-from generate import CONTENT_OUTPUT_ROOT, RENDER_CHECKPOINTS, active_worker_pids
+from generate import CONTENT_OUTPUT_ROOT, RENDER_CHECKPOINTS, active_worker_pids, get_active_job_id
+from generate import _covers_tree_guard
+from generate import warmup_comfyui
 from generate import router as generate_router
 from runner import ASPECTS as _RUNNER_ASPECTS
 from runner import _CANCEL_REQUESTED, _STOPPED_JOBS
 from runner import start_runner
 from generate import kill_job_processes
+import facebook_upload  # decide_mode preflight (path-only probe; no creds/network)
 # Shared publish core — ONE code path used by BOTH this endpoint and the runner's
 # auto-publish step. Constants/helpers below are re-imported (not redefined) so the
 # rest of main.py keeps working and there is a single source of truth.
 from publish_core import (  # noqa: E402  (leaf module, no import cycle)
+    API_UPLOAD_ENABLED,
     FACEBOOK_REELS_24H_LIMIT,
     PUBLISHABLE_PLATFORMS,
     UPLOAD_PRIVACY,
@@ -51,7 +68,15 @@ from publish_core import (  # noqa: E402  (leaf module, no import cycle)
     publish_video_core,
 )
 
+# .env is already loaded above (before the project imports). Re-affirm idempotently so
+# any late-imported module still sees it; harmless (override=False).
 load_dotenv()
+
+# Persist runner/script-gen diagnostics to a rotating file (the API runs with a hidden
+# window, so stdout is otherwise lost). Installed right after env load so CF_LOG_FILE is
+# honored and before anything emits. Idempotent under uvicorn --reload.
+import log_setup  # noqa: E402
+log_setup.setup()
 
 # Also load the external secrets .env (Google OAuth app creds), kept OUTSIDE the repo.
 # Best-effort: if absent, the clear error is raised lazily only when a publish needs it.
@@ -112,7 +137,38 @@ async def lifespan(app: FastAPI):
         tts_cache.start_eviction_async()
     except Exception as e:  # noqa: BLE001 — startup must never fail on this
         print(f"[startup] tts cache eviction trigger failed: {e}")
+    # Pre-load SDXL into ComfyUI so the owner's FIRST cover render isn't cold. Daemon
+    # thread — non-blocking, runs once per boot, best-effort (never fails startup).
+    try:
+        threading.Thread(target=warmup_comfyui, daemon=True).start()
+    except Exception as e:  # noqa: BLE001 — startup must never fail on this
+        print(f"[startup] comfyui warmup trigger failed: {e}")
+    # Retry media files a previous delete could not unlink because they were locked
+    # (typically our own /media stream). A fresh boot holds no handles, so this is the
+    # single best moment to catch them. Best-effort — never fails startup.
+    try:
+        res = sweep_pending_deletes()
+        if res["removed"] or res["stillPending"]:
+            print(f"[startup] pending deletes: removed {res['removed']}, "
+                  f"still locked {res['stillPending']}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[startup] pending-delete sweep failed: {e}")
     yield
+    # Graceful shutdown: wait for any active job to finish before exiting (up to
+    # 5 min). This ensures uvicorn --reload file-change restarts don't kill a
+    # mid-run TTS or render job. If the deadline is exceeded we proceed anyway.
+    _SHUTDOWN_WAIT_S = 300
+    deadline = time.monotonic() + _SHUTDOWN_WAIT_S
+    while True:
+        jid = get_active_job_id()
+        if jid is None:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(f"[shutdown] timeout after {_SHUTDOWN_WAIT_S}s — job {jid} still running, exiting anyway")
+            break
+        print(f"[shutdown] job {jid} in progress — waiting (up to {round(remaining)}s remaining)…")
+        await asyncio.sleep(5)
 
 
 app = FastAPI(title="ContentFactory Dashboard API", version="1.0.0", lifespan=lifespan)
@@ -120,7 +176,7 @@ app = FastAPI(title="ContentFactory Dashboard API", version="1.0.0", lifespan=li
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")],
-    allow_methods=["GET", "POST", "DELETE"],
+    allow_methods=["GET", "POST", "DELETE", "PATCH"],
     allow_headers=["*"],
 )
 
@@ -242,9 +298,9 @@ def fetch_accounts(conn) -> list[dict]:
 def fetch_jobs(conn) -> list[dict]:
     rows = conn.execute(
         """
-        SELECT id, page_id, input_type, input_payload, status, cost_usd, created_at, finished_at,
+        SELECT id, page_id, page_seq, input_type, input_payload, title, status, cost_usd, created_at, finished_at,
                edit_mode, aspect, render_model, voice_clone_model, progress_step, progress_pct, progress_msg, error,
-               needs_input,
+               needs_input, llm_provider, llm_model,
                (SELECT p.url FROM posts p JOIN videos v ON p.video_id = v.id
                  WHERE v.job_id = jobs.id AND p.platform = 'youtube' AND p.url IS NOT NULL
                  ORDER BY p.id DESC LIMIT 1) AS uploaded_url,
@@ -279,8 +335,14 @@ def fetch_jobs(conn) -> list[dict]:
         {
             "id": r["id"],
             "pageId": r["page_id"],
+            # Per-page display sequence ("Job #N"): stable, gap-free-at-creation,
+            # matches the job-history order. NULL only on rows predating the column.
+            "pageSeq": r["page_seq"],
             "inputType": r["input_type"],
             "inputPayload": r["input_payload"],
+            # Output title (owner-typed / auto-filled at batch-create). NULL for
+            # single-create jobs that never carried one. Powers the held-list review.
+            "title": r["title"],
             "status": r["status"],
             "costUsd": _num(r["cost_usd"]),
             "createdAt": _iso(r["created_at"]),
@@ -289,6 +351,10 @@ def fetch_jobs(conn) -> list[dict]:
             "aspect": r["aspect"],
             "renderModel": r["render_model"],
             "voiceCloneModel": r["voice_clone_model"],
+            # Per-job LLM choice. null = claude-cli (the subscription default) — the FE
+            # should render null as "Claude (subscription)", not as "unknown".
+            "llmProvider": r["llm_provider"],
+            "llmModel": r["llm_model"],
             "progressStep": r["progress_step"],
             "progressPct": r["progress_pct"],
             "progressMsg": r["progress_msg"],
@@ -312,7 +378,8 @@ def fetch_videos(conn) -> list[dict]:
     rows = conn.execute(
         """
         SELECT v.id, v.page_id, v.job_id, v.title, v.duration_s, v.status, v.created_at,
-               v.width, v.height, v.thumb_path, v.video_path,
+               v.width, v.height, v.thumb_path, v.video_path, v.facebook_tags,
+               v.llm_provider_used, v.llm_model_used,
                j.voice_clone_model, j.render_model, j.voice, j.src_audio_volume,
                j.edit_mode, j.aspect, j.target_sec, j.add_credit,
                -- Guard jsonb_array_length: Dubbed-mode videos store v.script as a JSON
@@ -337,7 +404,26 @@ def fetch_videos(conn) -> list[dict]:
                     JOIN platform_accounts pa ON pa.id = po.platform_account_id
                    WHERE po.video_id = v.id),
                  '{}'
-               ) AS published_page_ids
+               ) AS published_page_ids,
+               -- Full per-post detail (platform + status + permalink + which page)
+               -- so a card can, once posted, swap the "Publish" button for a link
+               -- to the real video + a status chip. Includes drafts (a draft is a
+               -- real upload, just not public) with its own status so the UI can
+               -- distinguish 'posted' (live) from 'draft'.
+               COALESCE(
+                 (SELECT jsonb_agg(jsonb_build_object(
+                            'platform', po.platform,
+                            'status', po.status,
+                            'url', po.url,
+                            'pageId', pa.page_id,
+                            'pageName', p2.name
+                          ) ORDER BY po.posted_at DESC)
+                    FROM posts po
+                    JOIN platform_accounts pa ON pa.id = po.platform_account_id
+                    JOIN pages p2 ON p2.id = pa.page_id
+                   WHERE po.video_id = v.id),
+                 '[]'::jsonb
+               ) AS posts
           FROM videos v
           LEFT JOIN jobs j ON j.id = v.job_id
          ORDER BY v.created_at DESC, v.id DESC
@@ -359,6 +445,7 @@ def fetch_videos(conn) -> list[dict]:
             # per-page Products block shows a video if pageId is its origin
             # (v.pageId) OR appears here.
             "publishedPageIds": r["published_page_ids"] or [],
+            "posts": r["posts"] or [],
             "width": r["width"],
             "height": r["height"],
             "videoUrl": media(r["video_path"]),
@@ -371,6 +458,12 @@ def fetch_videos(conn) -> list[dict]:
             "aspect": r["aspect"],
             "targetSec": int(r["target_sec"]) if r["target_sec"] is not None else None,
             "addCredit": bool(r["add_credit"]) if r["add_credit"] is not None else False,
+            "facebookTags": r["facebook_tags"],
+            # Which LLM ACTUALLY wrote this video's script. null on rows produced before
+            # the provider gate AND on script-reuse runs (no LLM ran) — null means
+            # "not recorded", NOT "claude-cli"; don't infer a provider that never ran.
+            "llmProviderUsed": r["llm_provider_used"],
+            "llmModelUsed": r["llm_model_used"],
         }
         for r in rows
     ]
@@ -607,11 +700,115 @@ def fetch_page_analytics(conn, page_id: int) -> dict:
         """,
         (page_id,),
     ).fetchall()
+    # Monthly buckets from the metrics table (per-post snapshots, e.g. YouTube).
+    monthly_map: dict[str, int] = {r["month"]: int(r["value"] or 0) for r in monthly_rows}
+
+    # --- LIVE Facebook Page Insights (page-level "Views") --------------------
+    # The metrics table is per-post; Facebook page views come straight from the
+    # Business-Suite "Views" metric (page_media_view) via the page's FB token —
+    # matching what the owner sees in Insights, no per-post tracking needed.
+    # Cached briefly so navigating the dashboard doesn't hammer the Graph API.
+    fb_acc = conn.execute(
+        """
+        SELECT credentials_ref, page_id
+          FROM platform_accounts
+         WHERE page_id = %s AND platform = 'facebook'
+         LIMIT 1
+        """,
+        (page_id,),
+    ).fetchone()
+    # Live Facebook Page follower/likes counts (best-effort, cached). Null when the
+    # page has no connected FB channel or the Graph call fails.
+    fb_followers: int | None = None
+    fb_fan_count: int | None = None
+    if fb_acc and _is_connected(fb_acc["credentials_ref"]):
+        fb = _facebook_page_views_cached(page_id, fb_acc["credentials_ref"])
+        if fb["total"] > 0 or fb["monthly"]:
+            # Facebook slice comes from live insights; drop any stale metrics-table
+            # facebook row so we don't double-count.
+            platform_split = [s for s in platform_split if s["platform"] != "facebook"]
+            platform_split.append({"platform": "facebook", "views": fb["total"], "pct": 0.0})
+            for m, v in fb["monthly"].items():
+                monthly_map[m] = monthly_map.get(m, 0) + v
+        foll = _facebook_page_followers_cached(page_id, fb_acc["credentials_ref"])
+        fb_followers = foll.get("followers")
+        fb_fan_count = foll.get("fanCount")
+
+    # Recompute percentages over the merged split.
+    grand_total = sum(int(s["views"] or 0) for s in platform_split)
+    for s in platform_split:
+        s["pct"] = round(int(s["views"] or 0) / grand_total * 100, 1) if grand_total else 0.0
+    platform_split.sort(key=lambda s: -int(s["views"] or 0))
+
     views_monthly = [
-        {"month": r["month"], "value": int(r["value"] or 0)} for r in monthly_rows
+        {"month": m, "value": monthly_map[m]} for m in sorted(monthly_map)
     ][-12:]
 
-    return {"platformSplit": platform_split, "viewsMonthly": views_monthly}
+    return {"platformSplit": platform_split, "viewsMonthly": views_monthly,
+            "followers": fb_followers, "fanCount": fb_fan_count}
+
+
+# Short-lived cache for live Facebook page-view insights (page_id -> (ts, payload)).
+# Keeps dashboard navigation from calling the Graph API on every render.
+_FB_VIEWS_CACHE: dict[int, tuple[float, dict]] = {}
+_FB_VIEWS_TTL_S = 300
+
+
+def _facebook_page_views_cached(page_id: int, credentials_ref: str) -> dict:
+    """Live Facebook page 'views' for the last ~12 months, aggregated to months.
+
+    Returns {"total": int, "monthly": {"YYYY-MM": int}}. Best-effort: on any
+    Graph error/timeout returns zeros (so the chart just stays empty, never 500s).
+    """
+    now = time.time()
+    hit = _FB_VIEWS_CACHE.get(page_id)
+    if hit and now - hit[0] < _FB_VIEWS_TTL_S:
+        return hit[1]
+
+    # Each Graph insights call carries a fixed ~20s latency for this Page regardless
+    # of range, and day-period caps the window at ~90 days ("Invalid parameter"
+    # beyond that). So make a SINGLE 90-day day-period call (covers the recent
+    # months the traffic panel shows) and cache the result — one slow call per TTL,
+    # not one per render.
+    until = int(now)
+    since = until - 89 * 24 * 3600
+    res = facebook_upload.page_insights_views(
+        {"credentials_ref": credentials_ref}, since=since, until=until, period="day"
+    )
+    monthly: dict[str, int] = {}
+    total = 0
+    if res.get("ok"):
+        for p in res["points"]:
+            month = (p["date"] or "")[:7]  # YYYY-MM
+            if not month:
+                continue
+            monthly[month] = monthly.get(month, 0) + p["value"]
+            total += p["value"]
+
+    payload = {"total": total, "monthly": monthly}
+    _FB_VIEWS_CACHE[page_id] = (now, payload)
+    return payload
+
+
+# Short-lived cache for live Facebook Page follower/likes counts (page_id -> (ts,
+# payload)). Same TTL as the views cache: one slow Graph call per TTL, not per render.
+_FB_FOLLOWERS_CACHE: dict[int, tuple[float, dict]] = {}
+
+
+def _facebook_page_followers_cached(page_id: int, credentials_ref: str) -> dict:
+    """Live Facebook Page follower + likes counts, cached with the SAME TTL as the
+    views cache. Returns {"followers": int|None, "fanCount": int|None}. Best-effort:
+    on any Graph error/timeout returns nulls (so the panel just omits the number,
+    never 500s)."""
+    now = time.time()
+    hit = _FB_FOLLOWERS_CACHE.get(page_id)
+    if hit and now - hit[0] < _FB_VIEWS_TTL_S:
+        return hit[1]
+    res = facebook_upload.page_followers({"credentials_ref": credentials_ref})
+    payload = ({"followers": res.get("followers"), "fanCount": res.get("fanCount")}
+               if res.get("ok") else {"followers": None, "fanCount": None})
+    _FB_FOLLOWERS_CACHE[page_id] = (now, payload)
+    return payload
 
 
 # ---- routes ------------------------------------------------------------
@@ -733,8 +930,10 @@ def analytics():
 
 @app.get("/api/pages/{page_id}/analytics")
 def page_analytics(page_id: int):
-    """Per-page analytics: { platformSplit, viewsMonthly }.
+    """Per-page analytics: { platformSplit, viewsMonthly, followers, fanCount }.
 
+    followers/fanCount are the live Facebook Page follower + likes counts (cached,
+    best-effort; null when the page has no connected FB channel or Graph fails).
     404 when the page does not exist; empty arrays when it exists but has no
     metrics yet (a page with no posts/metrics is valid, not an error).
     """
@@ -762,6 +961,60 @@ def platform_specs():
     (enforced=False) because the pipeline does not validate them.
     """
     return get_platform_specs()
+
+
+# ---- Exit project (whole-stack shutdown, EXCEPT PostgreSQL) ------------
+
+# Windows process-creation flags: run the killer FULLY DETACHED + windowless so
+# it OUTLIVES the API. Mirrors Dashboard/app.py's detached-launch pattern
+# (_start_comfyui_if_down / _start_api_detached).
+_DETACHED_PROCESS = 0x00000008
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_NO_WINDOW = 0x08000000
+
+
+@app.post("/api/shutdown")
+def shutdown():
+    """Tear down the whole ContentFactory stack EXCEPT PostgreSQL, then let this
+    API process be killed by the detached killer.
+
+    Returns {"ok": true} IMMEDIATELY (before anything is killed) so the browser
+    can react/close its tab. The actual teardown runs in exit_project.ps1, spawned
+    as a DETACHED, windowless PowerShell that is NOT a child of this API — so when
+    it kills the API/uvicorn LAST, it is not killing its own parent mid-run. The
+    script sleeps 1.5s first, giving this HTTP 200 time to flush.
+
+    PostgreSQL (Windows service postgresql-x64-16) is never touched.
+    """
+    api_dir = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(api_dir, "exit_project.ps1")
+    api_port = int(os.getenv("API_PORT", "4000"))
+    comfy_port = int(os.getenv("CF_COMFY_PORT", "8188"))
+
+    # CREATE_NO_WINDOW ONLY — mirrors app.py's _start_api_detached PowerShell launch.
+    # Do NOT add DETACHED_PROCESS: with it set, `powershell -File` is created (so
+    # Popen does not raise) but SILENTLY never executes the script — verified by a
+    # spawn-flag isolation test. CREATE_NO_WINDOW alone runs the killer, and it still
+    # outlives this API because on Windows killing a parent does not cascade to its
+    # child (and the killer kills this API LAST anyway).
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = _CREATE_NO_WINDOW
+
+    subprocess.Popen(
+        [
+            "powershell", "-NoProfile", "-WindowStyle", "Hidden",
+            "-ExecutionPolicy", "Bypass", "-File", script,
+            "-ApiPort", str(api_port), "-ComfyPort", str(comfy_port),
+        ],
+        cwd=api_dir,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=creationflags,
+        close_fds=True,
+    )
+    return {"ok": True}
 
 
 # ---- writes (Studio) ---------------------------------------------------
@@ -831,21 +1084,40 @@ class NewJob(BaseModel):
     bypassTtsCache: bool = False     # force-fresh TTS: skip the per-scene TTS cache READ
                                      # (every scene re-synthesized) but keep the WRITE.
                                      # Used by "Dùng lại kịch bản" (reuse script, fresh voice).
+    bypassScriptCache: bool = False  # force-fresh script-gen: skip per-batch cache READ
     aspect: str | None = None        # 9:16 | 16:9 | 1:1 | 4:5
     targetSec: int | None = None     # target OUTPUT length (whole source condensed into this)
     addCredit: bool = True           # append the source-credit slate at the end?
     renderModel: str | None = None   # render/animation engine key (see Studio model dropdown)
     voiceCloneModel: str | None = None  # voice-clone engine key (see Studio clone-model dropdown)
+    llmProvider: str | None = None   # TEXT script-gen backend (see GET /api/llm/models).
+                                     # NULL = 'claude-cli' — the subscription path, the default,
+                                     # and the only behavior that existed before the provider gate.
+    llmModel: str | None = None      # model id within that provider; NULL = its own default
     srcAudioVolume: float = 0.0      # original/source-audio volume in the final mix (0 = off, voiceover only)
     publish: bool = False            # opt-in: auto-publish when the job finishes
     publishPlatform: str | None = None  # when publish=true, auto-publish ONLY to this platform's connected
                                          # channel(s) of the job's own page. One of youtube|tiktok|instagram|
                                          # facebook, or null (null ⇒ no platform chosen ⇒ no auto-publish).
+    useCover: bool = False               # when true, apply coverImagePath as the video poster/thumbnail
+                                         # INSTEAD of an extracted frame.
+    coverImagePath: str | None = None    # abs path to an SDXL cover (from POST /generate/cover). Persisted
+                                         # to jobs.cover_image_path ONLY when useCover is true.
+    facebookTags: str | None = None      # owner-edited Facebook hashtag block ("#a #b ..."), generated via
+                                         # POST /generate/tags. Persisted to jobs.facebook_tags and copied
+                                         # onto the video row by the runner for copy-at-upload-time.
 
 
-@app.post("/api/jobs")
-def create_job(body: NewJob):
-    """Enqueue a production job. The pipeline (ingest → assemble) picks it up."""
+def _insert_job(body: NewJob, status: str = "queued") -> dict:
+    """Validate + INSERT a single production job row and return {"id", "status"}.
+    This is the ONE authoritative create path — both the single POST /api/jobs route
+    and the batch endpoint call it, so the validation and the INSERT never diverge.
+
+    `status` defaults to 'queued' (the normal single-create path: the runner claims
+    it immediately). The batch/source-list endpoint passes status='held' so the rows
+    are only PERSISTED — the runner's _claim_job selects only 'queued', so 'held'
+    jobs sit until POST /api/jobs/release flips them to 'queued'.
+    """
     # Clamp source-audio volume to [0, 1] (UI offers 0.0 / 0.05 / 0.10 / 0.15;
     # accept anything but never let it leave the valid mix range).
     src_audio_volume = min(1.0, max(0.0, body.srcAudioVolume))
@@ -868,25 +1140,200 @@ def create_job(body: NewJob):
             v = conn.execute(
                 "SELECT id FROM videos WHERE id = %s", (reuse_script_video_id,)
             ).fetchone()
-        if not v:
+        # Accept either a surviving DB video OR an orphaned render-cache manifest
+        # (deleted-with-keepScript scripts are reusable script-only — the runner's
+        # _load_reusable_script falls back to load_manifest). Reject only when NEITHER
+        # exists, so a truly stale id still fails fast at creation instead of deep in
+        # the runner.
+        if not v and not render_cache.has_cached_render(reuse_script_video_id):
             raise HTTPException(404, f"reuseScriptVideoId {reuse_script_video_id}: video not found")
+    # Cover: only persist the cover path when the owner opted in (useCover). A path
+    # without useCover is ignored (the runner extracts a frame as usual).
+    cover_image_path = (body.coverImagePath or "").strip() or None if body.useCover else None
     with get_conn() as conn:
         row = conn.execute(
             """
-            INSERT INTO jobs (page_id, input_type, input_payload, status,
+            INSERT INTO jobs (page_id, page_seq, input_type, input_payload, status,
                               voice, edit_mode, comment, source_video_id,
                               aspect, target_sec, add_credit, render_model, voice_clone_model,
                               src_audio_volume, publish, title, publish_platform,
-                              reuse_script_video_id, bypass_tts_cache)
-            VALUES (%s, 'link', %s, 'queued', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
+                              reuse_script_video_id, bypass_tts_cache, bypass_script_cache,
+                              cover_image_path, facebook_tags, llm_provider, llm_model)
+            VALUES (%s,
+                    (SELECT COALESCE(MAX(page_seq), 0) + 1 FROM jobs WHERE page_id = %s),
+                    'link', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id, page_seq
             """,
-            (body.pageId, body.link, body.voice, body.editMode, body.comment, body.sourceVideoId,
+            (body.pageId, body.pageId, body.link, status, body.voice, body.editMode, body.comment, body.sourceVideoId,
              body.aspect, body.targetSec, body.addCredit, body.renderModel, body.voiceCloneModel,
              src_audio_volume, body.publish, (body.title or "").strip() or None, publish_platform,
-             reuse_script_video_id, body.bypassTtsCache),
+             reuse_script_video_id, body.bypassTtsCache, body.bypassScriptCache,
+             cover_image_path, (body.facebookTags or "").strip() or None,
+             # Empty string -> NULL so "no choice" is stored as NULL, never as "", and the
+             # runner's `or None` normalization has nothing to paper over.
+             (body.llmProvider or "").strip().lower() or None,
+             (body.llmModel or "").strip() or None),
         ).fetchone()
-    return {"id": row["id"], "status": "queued"}
+    return {"id": row["id"], "status": status, "pageSeq": row["page_seq"]}
+
+
+@app.post("/api/jobs")
+def create_job(body: NewJob):
+    """Enqueue a production job. The pipeline (ingest → assemble) picks it up."""
+    return _insert_job(body)
+
+
+# ---- BATCH ("Add List"): preview many links, then create one job per link ----
+
+# Bound the batch so a paste of hundreds of links can't tie up the probe/translate
+# path (each item probes the source + runs a Claude-headless translation).
+BATCH_MAX_LINKS = int(os.getenv("BATCH_MAX_LINKS", "30"))
+
+
+class BatchPreviewRequest(BaseModel):
+    links: list[str] = []
+
+
+class BatchItem(BaseModel):
+    link: str
+    title: str | None = None   # FINAL output title (FE may have edited the VN suggestion)
+
+
+class BatchCreate(BaseModel):
+    pageId: int
+    items: list[BatchItem] = []
+    # Shared settings applied to EVERY job in the batch (same knobs as NewJob).
+    editMode: str | None = None
+    voice: str | None = None
+    aspect: str | None = None
+    renderModel: str | None = None
+    voiceCloneModel: str | None = None
+    llmProvider: str | None = None   # NULL = claude-cli (see NewJob)
+    llmModel: str | None = None
+    srcAudioVolume: float = 0.0
+    addCredit: bool = True
+    useCover: bool = False
+    coverImagePath: str | None = None
+
+
+@app.post("/api/jobs/batch/preview")
+def batch_preview(body: BatchPreviewRequest):
+    """SIDE-EFFECT-FREE: for each link, probe its ORIGINAL title (same probe path as
+    POST /generate/probe_link). Creates NO jobs and does NOT call Claude — the owner
+    types the Vietnamese title manually in the modal, so `viTitle` is returned empty
+    (no auto-translation, saves subscription usage).
+
+    Order is preserved. One bad link yields {link, error} and does NOT abort the
+    batch. Capped at BATCH_MAX_LINKS to bound the probe work.
+    """
+    links = [l.strip() for l in (body.links or []) if l and l.strip()]
+    if not links:
+        raise HTTPException(422, "Chưa có link nào để xem trước.")
+    if len(links) > BATCH_MAX_LINKS:
+        raise HTTPException(
+            422,
+            f"Quá nhiều link ({len(links)}). Tối đa {BATCH_MAX_LINKS} link mỗi lần.",
+        )
+
+    results = []
+    for link in links:
+        try:
+            probed = generate._run_cf_worker("probe_worker.py", {"link": link}, timeout=90)
+            original_title = (probed or {}).get("title") or ""
+            if not original_title:
+                results.append({"link": link, "error": "Không lấy được tiêu đề nguồn."})
+                continue
+            # No auto-translation: the owner fills the Vietnamese title by hand in
+            # the modal. Return an empty viTitle (probe-only, no Claude call).
+            results.append({
+                "link": link,
+                "originalTitle": original_title,
+                "viTitle": "",
+            })
+        except HTTPException as e:
+            results.append({"link": link, "error": str(e.detail)})
+        except Exception as e:  # noqa: BLE001 — one bad link never fails the batch
+            results.append({"link": link, "error": str(e)[:300] or "Probe thất bại."})
+    return {"results": results}
+
+
+@app.post("/api/jobs/batch")
+def batch_create(body: BatchCreate):
+    """Create one HELD job per item (sequentially), reusing the exact single-job
+    insert path (_insert_job). Titles are FINAL (already edited by the FE). Shared
+    settings apply to every job. Order preserved; per-item errors are non-fatal.
+
+    The jobs are PERSISTED with status='held' — the runner's _claim_job selects only
+    'queued', so these rows do NOT start rendering on save. They flush into the queue
+    when the owner clicks the main "Tạo video" button, which calls POST
+    /api/jobs/release (flips this page's 'held' rows → 'queued'). Nothing is run
+    inline here.
+    """
+    if not body.items:
+        raise HTTPException(422, "Chưa có mục nào để tạo.")
+    if len(body.items) > BATCH_MAX_LINKS:
+        raise HTTPException(
+            422,
+            f"Quá nhiều mục ({len(body.items)}). Tối đa {BATCH_MAX_LINKS} job mỗi lần.",
+        )
+
+    results = []
+    for item in body.items:
+        link = (item.link or "").strip()
+        if not link:
+            results.append({"link": item.link or "", "error": "Thiếu link."})
+            continue
+        try:
+            job = _insert_job(NewJob(
+                pageId=body.pageId,
+                link=link,
+                title=item.title,
+                editMode=body.editMode,
+                voice=body.voice,
+                aspect=body.aspect,
+                renderModel=body.renderModel,
+                voiceCloneModel=body.voiceCloneModel,
+                llmProvider=body.llmProvider,
+                llmModel=body.llmModel,
+                srcAudioVolume=body.srcAudioVolume,
+                addCredit=body.addCredit,
+                useCover=body.useCover,
+                coverImagePath=body.coverImagePath,
+            ), status="held")
+            results.append({"link": link, "jobId": job["id"]})
+        except HTTPException as e:
+            results.append({"link": link, "error": str(e.detail)})
+        except Exception as e:  # noqa: BLE001 — one bad item never fails the batch
+            results.append({"link": link, "error": str(e)[:300] or "Tạo job thất bại."})
+    return {"results": results}
+
+
+class ReleaseJobsRequest(BaseModel):
+    pageId: int
+
+
+@app.post("/api/jobs/release")
+def release_jobs(body: ReleaseJobsRequest):
+    """Flush a page's HELD jobs into the queue.
+
+    The source-list "Save" (POST /api/jobs/batch) persists jobs with status='held'
+    so they do NOT auto-run. When the owner clicks the main "Tạo video" button the
+    frontend calls this to flip ALL of that page's 'held' jobs to 'queued', so the
+    in-process runner (which claims only 'queued') picks them up. Returns the count
+    released. A page with no held jobs releases 0 (not an error).
+    """
+    # Guard pageId: must reference an existing page (404 otherwise), so a stale/bad
+    # id can't silently no-op and hide a frontend bug.
+    with get_conn() as conn:
+        page = conn.execute("SELECT id FROM pages WHERE id = %s", (body.pageId,)).fetchone()
+        if not page:
+            raise HTTPException(404, f"Page {body.pageId} not found")
+        rows = conn.execute(
+            "UPDATE jobs SET status = 'queued'"
+            " WHERE page_id = %s AND status = 'held' RETURNING id",
+            (body.pageId,),
+        ).fetchall()
+    return {"released": len(rows)}
 
 
 # ---- PART B: reusable-script picker + script preview ------------------------
@@ -912,6 +1359,146 @@ def _derive_render_mode(render_model: str | None, render_mode: str | None) -> st
     if rm in RENDER_CHECKPOINTS:
         return "image"
     return None
+
+
+def _norm_narr(text: str | None) -> str:
+    """Normalize a scene narration for stale-vs-cached comparison (whitespace-
+    collapsed, stripped). Two narrations that differ only in surrounding/inner
+    whitespace are considered the SAME line."""
+    return " ".join((text or "").split()).strip()
+
+
+def _manifest_scene_wavs_present(video_id: int, manifest: dict) -> bool:
+    """True iff EVERY scene in the manifest has its cached wav present on disk under
+    _cache/renders/<video_id>/. This is exactly what the reuse-with-audio path
+    (load_manifest → assemble) consumes, so it's the honest 'audioCached' signal.
+    Empty manifest scenes → False."""
+    scenes = manifest.get("scenes") if isinstance(manifest, dict) else None
+    if not isinstance(scenes, list) or not scenes:
+        return False
+    rdir = render_cache.render_dir(video_id)
+    for sc in scenes:
+        if not isinstance(sc, dict):
+            return False
+        aname = sc.get("audio") or f"scene{int(sc.get('scene', 0)):03d}.wav"
+        ap = os.path.join(rdir, aname)
+        try:
+            if not (os.path.isfile(ap) and os.path.getsize(ap) > 0):
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def _audio_status_for_script(video_id: int, db_scenes) -> tuple[bool, bool]:
+    """Compute (audioCached, audioStale) for a DB video's reusable script.
+
+    - audioCached: the manifest's per-scene wavs are ALL present on disk (that's
+      what the reuse-with-audio flow reads).
+    - audioStale: audio exists BUT the current videos.script narrations no longer
+      match the narrations snapshotted in the manifest (script edited after the
+      audio was generated). Compared per-scene, whitespace-normalized. If the scene
+      COUNT differs, or any narration differs, it's stale. Fixes the cross-session
+      'edited but no warning' bug.
+    Returns (False, False) when no manifest / no cached audio."""
+    # Read the manifest raw (no per-scene file-existence validation) so an edited
+    # script whose wavs are still present can be flagged stale; we check wav
+    # presence explicitly below via _manifest_scene_wavs_present.
+    raw = _read_manifest_raw(video_id)
+    if not raw:
+        return False, False
+    audio_cached = _manifest_scene_wavs_present(video_id, raw)
+    if not audio_cached:
+        return False, False
+    # Staleness: compare current DB script narrations vs manifest snapshot.
+    m_scenes = raw.get("scenes") or []
+    db_list = db_scenes if isinstance(db_scenes, list) else []
+    if len(m_scenes) != len(db_list):
+        return True, True
+    for m, d in zip(m_scenes, db_list):
+        m_narr = _norm_narr(m.get("narration") if isinstance(m, dict) else None)
+        d_narr = _norm_narr(d.get("narration") if isinstance(d, dict) else None)
+        if m_narr != d_narr:
+            return True, True
+    return True, False
+
+
+def _read_manifest_raw(video_id: int) -> dict | None:
+    """Read manifest.json for a video_id WITHOUT the per-scene file-existence
+    validation load_manifest does (so an edited script with partially-missing wavs
+    can still be inspected). Returns the parsed dict or None. Path-guarded, never
+    raises."""
+    if not render_cache.render_cache_enabled():
+        return None
+    try:
+        mp = render_cache.manifest_path(video_id)
+    except ValueError:
+        return None
+    try:
+        if not (os.path.isfile(mp) and os.path.getsize(mp) > 0):
+            return None
+        with open(mp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _orphaned_manifest_items(page_id: int, db_video_ids: set[int]) -> list[dict]:
+    """Scan _cache/renders/*/manifest.json for manifests whose videoId has NO
+    surviving videos row for THIS page, and map each to the reusable-scripts item
+    shape with source='manifest'. The reuse id is the manifest's videoId.
+
+    A manifest carries `page` (name), not page_id, so we match by the page's NAME.
+    Best-effort: unreadable/mismatched manifests are skipped. Returns newest-first
+    is not guaranteed (no timestamp in the manifest) — appended after DB rows."""
+    if not render_cache.render_cache_enabled():
+        return []
+    with get_conn() as conn:
+        prow = conn.execute("SELECT name FROM pages WHERE id = %s", (page_id,)).fetchone()
+    if not prow:
+        return []
+    page_name = prow["name"]
+    root = render_cache.renders_root()
+    if not os.path.isdir(root):
+        return []
+    out: list[dict] = []
+    for entry in os.listdir(root):
+        sub = os.path.join(root, entry)
+        if not os.path.isdir(sub):
+            continue
+        try:
+            vid = int(entry)
+        except ValueError:
+            continue
+        if vid in db_video_ids:
+            continue  # a surviving DB row already covers this id
+        data = _read_manifest_raw(vid)
+        if not data:
+            continue
+        # Only manifests belonging to THIS page (matched by page name).
+        if (data.get("page") or None) != page_name:
+            continue
+        scenes = data.get("scenes") if isinstance(data.get("scenes"), list) else []
+        first_narr = None
+        if scenes and isinstance(scenes[0], dict):
+            first_narr = scenes[0].get("narration")
+        preview = (first_narr[:120] + "…") if (first_narr and len(first_narr) > 120) else first_narr
+        out.append({
+            "videoId": int(data.get("videoId") or vid),
+            "title": data.get("title"),
+            "sourceLink": data.get("sourceLink"),
+            "sourceName": data.get("sourceName"),
+            "renderMode": data.get("renderMode"),
+            "editMode": None,
+            "sceneCount": len(scenes),
+            "preview": preview,
+            "createdAt": None,
+            "audioCached": False,
+            "audioStale": False,
+            "source": "manifest",
+        })
+    return out
 
 
 @app.get("/api/pages/{page_id}/reusable-scripts")
@@ -944,7 +1531,9 @@ def reusable_scripts(page_id: int, link: str | None = None):
         rows = conn.execute(
             f"""
             SELECT v.id, v.title, v.source_link, v.source_name, v.created_at,
-                   jsonb_array_length(v.script) AS scene_count,
+                   v.script,
+                   CASE WHEN jsonb_typeof(v.script) = 'array'
+                        THEN jsonb_array_length(v.script) ELSE 0 END AS scene_count,
                    v.script->0->>'narration' AS first_narration,
                    j.render_model, j.render_mode, j.edit_mode
               FROM videos v
@@ -952,19 +1541,27 @@ def reusable_scripts(page_id: int, link: str | None = None):
              WHERE v.page_id = %s
                AND v.script IS NOT NULL
                -- Only array-shaped scripts are reusable. Dubbed-mode scripts are JSON
-               -- objects (not scene arrays); excluding them here also keeps the SELECT's
-               -- jsonb_array_length from raising on a non-array.
+               -- objects (not scene arrays), so we EXCLUDE them via jsonb_typeof='array'.
+               -- jsonb_array_length must NOT be called bare on v.script: Postgres does not
+               -- guarantee the typeof filter runs (nor the AND short-circuits) before the
+               -- length expression, so a dubbed object row would raise
+               -- "cannot get array length of a non-array" and 500 the query. Wrap every
+               -- jsonb_array_length in a CASE typeof guard (same pattern as fetch_videos).
                AND jsonb_typeof(v.script) = 'array'
-               AND jsonb_array_length(v.script) > 0
+               AND (CASE WHEN jsonb_typeof(v.script) = 'array'
+                         THEN jsonb_array_length(v.script) ELSE 0 END) > 0
                {link_clause}
              ORDER BY v.created_at DESC, v.id DESC
             """,
             tuple(params),
         ).fetchall()
     out = []
+    db_video_ids: set[int] = set()
     for r in rows:
+        db_video_ids.add(r["id"])
         narr = r["first_narration"]
         preview = (narr[:120] + "…") if (narr and len(narr) > 120) else narr
+        audio_cached, audio_stale = _audio_status_for_script(r["id"], r["script"])
         out.append(
             {
                 "videoId": r["id"],
@@ -976,22 +1573,40 @@ def reusable_scripts(page_id: int, link: str | None = None):
                 "sceneCount": r["scene_count"],
                 "preview": preview,
                 "createdAt": _iso(r["created_at"]),
+                "audioCached": audio_cached,
+                "audioStale": audio_stale,
+                "source": "db",
             }
         )
+    # UNION in orphaned manifests: cached scripts whose DB video row is gone but the
+    # manifest survives (e.g. deleted with keepScript=true). These are script-only.
+    out.extend(_orphaned_manifest_items(page_id, db_video_ids))
     return out
 
 
 @app.get("/api/videos/{video_id}/script")
 def video_script(video_id: int):
-    """Full saved script of a video, for the reuse-picker preview.
+    """Full saved script of a video, for the reuse-picker / script-preview.
 
-    Shape: { videoId, title, renderMode, sceneCount, scenes: [...] }
-    404 if the video does not exist OR has no script (NULL/empty)."""
+    videos.script is stored in TWO shapes and this endpoint returns BOTH via a
+    `kind` discriminator so the frontend can render each correctly:
+
+      - Scene-array jobs (image/footage/stickman): script is a JSON ARRAY of scene
+        objects → kind:"scenes", plus sceneCount + scenes (the array).
+      - Dubbed jobs (edit_mode='dubbed'): script is a JSON OBJECT
+        {mode:'dubbed', subs:[{start,end,text_vi}], filler:[]} → kind:"dubbed",
+        plus subCount + subs (and `mode` passed through).
+
+    Common fields on every response: videoId, title, renderMode, editMode, kind.
+
+    404 ONLY when the video is missing, or the script is NULL / an empty array /
+    an unrecognized-or-empty object with no `subs`. A dict without a non-empty
+    `subs` list has nothing to show → 404."""
     with get_conn() as conn:
         row = conn.execute(
             """
             SELECT v.id, v.title, v.script,
-                   j.render_model, j.render_mode
+                   j.render_model, j.render_mode, j.edit_mode
               FROM videos v
               LEFT JOIN jobs j ON j.id = v.job_id
              WHERE v.id = %s
@@ -1000,16 +1615,27 @@ def video_script(video_id: int):
         ).fetchone()
     if not row:
         raise HTTPException(404, "Video not found")
-    scenes = row["script"]
-    if not isinstance(scenes, list) or not scenes:
-        raise HTTPException(404, "Video has no script to preview")
-    return {
+    script = row["script"]
+    common = {
         "videoId": row["id"],
         "title": row["title"],
         "renderMode": _derive_render_mode(row["render_model"], row["render_mode"]),
-        "sceneCount": len(scenes),
-        "scenes": scenes,
+        "editMode": row["edit_mode"],
     }
+    # Scene-array shape (image/footage/stickman).
+    if isinstance(script, list) and script:
+        return {**common, "kind": "scenes", "sceneCount": len(script), "scenes": script}
+    # Dubbed shape: {mode:'dubbed', subs:[...], filler:[...]}. Only show it when it
+    # actually carries a non-empty subs list — an empty/degenerate object has nothing
+    # to preview.
+    if isinstance(script, dict):
+        subs = script.get("subs")
+        if isinstance(subs, list) and subs:
+            out = {**common, "kind": "dubbed", "subCount": len(subs), "subs": subs}
+            if script.get("mode") is not None:
+                out["mode"] = script.get("mode")
+            return out
+    raise HTTPException(404, "Video has no script to preview")
 
 
 @app.get("/api/videos/{video_id}/scenes/{scene_num}/audio")
@@ -1069,6 +1695,45 @@ def clear_video_script(video_id: int):
     return {"ok": True, "id": video_id}
 
 
+class SetCoverBody(BaseModel):
+    path: str  # abs path of the image to use as this video's cover/thumbnail
+
+
+@app.post("/api/videos/{video_id}/cover")
+def set_video_cover(video_id: int, body: SetCoverBody):
+    """Change a produced video's cover/thumbnail (videos.thumb_path only).
+
+    Body: { path }. Sets videos.thumb_path to `path` and returns
+      { ok: True, thumbUrl: "/media?path=<urlencoded path>" }
+    using the same media() shape fetch_videos exposes.
+
+    This is a display/metadata change ONLY — the mp4 is NOT re-encoded/re-muxed,
+    and the OLD thumb file is NOT deleted (it may be shared or the owner may
+    revert). The frontend picks an image (typically a saved cover) and calls this.
+
+    Validation:
+      - 404 if the video does not exist.
+      - 404 if the file at `path` does not exist on disk.
+      - 403 if the resolved realpath is outside CONTENT_OUTPUT_ROOT
+        (path-traversal guard — same _covers_tree_guard used by /media and the
+        cover-save endpoint). Any image inside that tree is accepted.
+    """
+    # Path-traversal guard first (403 before touching the DB); returns the realpath.
+    full = _covers_tree_guard(body.path)
+    if not os.path.isfile(full):
+        raise HTTPException(404, "File not found")
+    with get_conn() as conn:
+        row = conn.execute("SELECT id FROM videos WHERE id = %s", (video_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, f"Video {video_id} not found")
+        # Store the caller-supplied path (same value the client passed / that the
+        # saved-covers list returns). Single UPDATE, no file/mp4 side effects.
+        conn.execute(
+            "UPDATE videos SET thumb_path = %s WHERE id = %s", (body.path, video_id)
+        )
+    return {"ok": True, "thumbUrl": f"/media?path={quote(body.path)}"}
+
+
 class UpdateSceneBody(BaseModel):
     narration: str
 
@@ -1091,6 +1756,16 @@ def update_scene_narration(video_id: int, scene_num: int, body: UpdateSceneBody)
             if row is None or row["script"] is None:
                 raise HTTPException(404, f"No script for video {video_id}")
             scenes = row["script"]
+            # Per-scene narration edit only applies to scene-array scripts. A Dubbed
+            # video stores script as a {mode,subs,filler} OBJECT; iterating it would
+            # walk its string keys and crash (AttributeError → 500). Fail cleanly so
+            # the UI (which should not offer per-scene edit for dubbed) gets a clear
+            # 400 instead of a server error.
+            if not isinstance(scenes, list):
+                raise HTTPException(
+                    400,
+                    "Chỉnh sửa lời thoại theo cảnh không áp dụng cho video lồng tiếng (dubbed).",
+                )
             target = None
             for sc in scenes:
                 if sc.get("scene") == scene_num:
@@ -1152,8 +1827,8 @@ def _resolve_active_model(step: str | None, voice_clone_model: str | None,
     if not step:
         return None
     if step == "voice":
-        # Engine dispatch mirrors runner.py: f5-tts → F5; everything else → VieNeu.
-        return "F5-TTS" if (voice_clone_model or "").strip().lower() == "f5-tts" else "VieNeu-TTS"
+        # F5-TTS is the project default. Only show VieNeu when explicitly set to "vieneu".
+        return "VieNeu-TTS" if (voice_clone_model or "").strip().lower() == "vieneu" else "F5-TTS"
     if step in ("footage", "image"):
         rm = (render_model or "").strip().lower()
         if rm.startswith("stickman"):
@@ -1282,19 +1957,95 @@ def _ram_stats(pids: set[int]) -> dict:
     return {"taskMB": (rss // (1024 * 1024)) if rss is not None else None}
 
 
-def _cpu_percent() -> int | None:
-    """Whole-machine CPU utilization % via wmic (no psutil needed)."""
-    try:
-        out = subprocess.run(
-            ["wmic", "cpu", "get", "loadpercentage", "/value"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout
-        for line in out.splitlines():
-            if "LoadPercentage=" in line:
-                return int(line.split("=", 1)[1].strip())
-    except Exception:
-        pass
-    return None
+# pid → kernel+user ticks (100-ns units) from the previous poll
+_cpu_prev_samples: dict[int, int] = {}
+# GetSystemTimes ker+usr snapshot (sum across all logical CPUs) — used as the
+# denominator so the task % is bounded by the real system CPU, not wall×n_cores.
+_cpu_prev_sys_ticks: list[int | None] = [None]
+_cpu_prev_lock = threading.Lock()
+
+
+def _cpu_percent(pids: set[int]) -> int | None:
+    """Task-scoped CPU % using GetSystemTimes + GetProcessTimes deltas.
+
+    Denominator = Δ(kernel+user) from GetSystemTimes (summed across all logical
+    CPUs by Windows) — the real total CPU budget for the interval.
+
+        % = Σ Δprocess_ticks / Δsystem_ticks × 100
+
+    This prevents the chip from ever exceeding the actual system-wide CPU %,
+    even when os.cpu_count() under-reports or PID-reuse inflates the task tree.
+    """
+    k32 = ctypes.windll.kernel32
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    if not pids:
+        with _cpu_prev_lock:
+            _cpu_prev_samples.clear()
+            _cpu_prev_sys_ticks[0] = None
+        return None
+
+    # IMPORTANT — sampling ORDER fixes the historical "chip > Task Manager" skew.
+    # The numerator (Σ Δ per-process ticks) is read endpoint-to-endpoint across
+    # this GetProcessTimes loop; the denominator (Δ GetSystemTimes) MUST span the
+    # SAME interval. If GetSystemTimes were sampled BEFORE the loop, the stored
+    # "prev" system endpoint would mark the loop START while the process endpoints
+    # mark the loop END — offsetting the two windows by the loop duration L. When
+    # a poll's loop is slower than the prior poll's (L_t > L_{t-1}), the task
+    # accrues ticks over a LONGER window than the denominator covers, so the ratio
+    # inflates (measured: true 16% reads as 32-42% on slow polls) and clamps at
+    # 100. Sampling system ticks AFTER the loop — and storing THAT as prev for the
+    # next poll — aligns both endpoints, so the windows are identical-length every
+    # poll. (Empirically verified: NEW reads a steady 16% vs OLD's 7-42% swing.)
+    current: dict[int, int] = {}
+    for pid in pids:
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            continue
+        try:
+            ct = ctypes.c_uint64()
+            et = ctypes.c_uint64()
+            kt = ctypes.c_uint64()
+            ut = ctypes.c_uint64()
+            if k32.GetProcessTimes(h,
+                                   ctypes.byref(ct), ctypes.byref(et),
+                                   ctypes.byref(kt), ctypes.byref(ut)):
+                current[pid] = kt.value + ut.value
+        finally:
+            k32.CloseHandle(h)
+
+    # System-wide CPU total: GetSystemTimes sums across ALL logical CPUs.
+    # lpKernelTime includes idle time, so ker+usr covers the full CPU budget.
+    # Sampled AFTER the per-PID loop so its endpoint aligns with the process
+    # endpoints above (see the timing-window note before the loop).
+    si_idle = ctypes.c_uint64()
+    si_ker  = ctypes.c_uint64()
+    si_usr  = ctypes.c_uint64()
+    sys_now: int | None = None
+    if k32.GetSystemTimes(ctypes.byref(si_idle), ctypes.byref(si_ker), ctypes.byref(si_usr)):
+        sys_now = si_ker.value + si_usr.value
+
+    with _cpu_prev_lock:
+        prev     = dict(_cpu_prev_samples)
+        prev_sys = _cpu_prev_sys_ticks[0]
+        _cpu_prev_samples.clear()
+        _cpu_prev_samples.update(current)
+        _cpu_prev_sys_ticks[0] = sys_now
+
+    if not prev or not current or prev_sys is None or sys_now is None:
+        return None
+
+    delta_sys = sys_now - prev_sys
+    if delta_sys <= 0:
+        return None
+
+    delta_task = sum(
+        ticks - prev[pid]
+        for pid, ticks in current.items()
+        if pid in prev and ticks >= prev[pid]
+    )
+
+    return max(0, min(100, round(delta_task / delta_sys * 100)))
 
 
 def _gpu_util() -> int | None:
@@ -1373,6 +2124,31 @@ def _vram_stats(pids: set[int]) -> dict:
     return {"taskMB": task_mb, "gpuUtil": util, "note": None}
 
 
+@app.get("/api/llm/models")
+def llm_models(refresh: bool = Query(False, description="bypass the 6h disk cache")):
+    """The TEXT script-gen backends this machine can actually use right now.
+
+    Shape:
+      {"options": [{provider, model, label, is_default, reliability, notes}, ...],
+       "generated_at": "<iso8601>", "cached": <bool>}
+
+    Contract the Studio can rely on:
+      * `claude-cli` (model null) is ALWAYS present and is the ONLY `is_default: true`
+        entry — it is the existing subscription path and needs no key check.
+      * A provider with no API key in the environment is simply ABSENT. It is never
+        listed-but-broken, and a job that somehow still names it fails with a clear
+        message rather than silently running on a different provider.
+      * Every `openrouter` entry is `reliability: "low"`, unconditionally: Phase 1
+        measured its free models burning their token budget on chain-of-thought and
+        under-delivering. Present because the owner wants the option; never a default.
+
+    Discovery hits Gemini's ListModels and OpenRouter's public /models, so the result is
+    disk-cached for 6h (LLM_MODELS_CACHE_TTL_HOURS) — a dashboard page load must not cost
+    a round of provider calls. `?refresh=1` forces a re-discovery.
+    """
+    return llm_gate.list_model_options(force_refresh=refresh)
+
+
 @app.get("/api/system")
 def system_stats():
     """Task-scoped resource usage + which model the running job is using.
@@ -1402,7 +2178,7 @@ def system_stats():
     return {
         "ram": _ram_stats(pids),
         "vram": _vram_stats(pids),
-        "cpu": {"percent": _cpu_percent()},
+        "cpu": {"percent": _cpu_percent(pids)},
         "activeJobId": job_id,
         "activeStep": step,
         "activeModel": _resolve_active_model(
@@ -1410,6 +2186,9 @@ def system_stats():
             row["voice_clone_model"] if row else None,
             row["render_model"] if row else None,
         ),
+        # Whether API publishing is currently enabled (env kill-switch). The FE polls
+        # /api/system and uses this to hide/disable the "Đăng qua API" actions.
+        "apiUploadEnabled": API_UPLOAD_ENABLED,
     }
 
 
@@ -1463,16 +2242,120 @@ def _guard_path(path: str | None) -> tuple[str | None, str | None]:
     return full, None
 
 
-def _remove_files(paths, *, protected: set[str] | None = None) -> tuple[list[str], list[str]]:
+# ---- Deferred deletion of LOCKED media ---------------------------------------
+#
+# Windows refuses os.remove on a file another process still holds open. The common case
+# here is our OWN /media endpoint streaming an mp4 into the dashboard's <video> preview:
+# the owner watches a video, deletes its job, and the unlink fails with
+#   [WinError 32] The process cannot access the file because it is being used by another
+# Before 2026-07-28 that error was logged and SWALLOWED while the DB row was deleted
+# anyway, so the file became a permanent orphan with nothing left pointing at it (audit
+# found 1486 such files / 5.41 GB). Now: retry briefly (the stream lock clears in
+# seconds), and if it still fails, remember the path so a later delete or the next boot
+# finishes the job.
+_UNLINK_RETRIES = int(os.getenv("DELETE_UNLINK_RETRIES", "4"))
+_UNLINK_BACKOFF_S = float(os.getenv("DELETE_UNLINK_BACKOFF_S", "0.35"))
+# WinError 32 = sharing violation, 33 = lock violation. Only these are worth retrying;
+# anything else (missing, permission, read-only) will not fix itself.
+_RETRYABLE_WINERR = (32, 33)
+
+
+def _pending_deletes_path() -> str:
+    return os.path.join(CONTENT_OUTPUT_ROOT, "_cache", "pending_deletes.json")
+
+
+def _pending_load() -> list[str]:
+    try:
+        with open(_pending_deletes_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return [str(p) for p in data] if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _pending_save(paths) -> None:
+    """Persist the pending list (deduped, order-stable). Best-effort: never raises."""
+    try:
+        fp = _pending_deletes_path()
+        os.makedirs(os.path.dirname(fp), exist_ok=True)
+        seen, out = set(), []
+        for p in paths:
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
+        with open(fp, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=1)
+    except OSError as exc:
+        print(f"[delete] could not persist pending-delete list: {exc}")
+
+
+def _try_unlink(full: str) -> str | None:
+    """os.remove with a short retry on a Windows sharing/lock violation.
+    Returns None on success, else the last error string."""
+    last = ""
+    for attempt in range(1, max(1, _UNLINK_RETRIES) + 1):
+        try:
+            os.remove(full)
+            return None
+        except OSError as exc:
+            last = str(exc)
+            if getattr(exc, "winerror", None) not in _RETRYABLE_WINERR:
+                break
+            if attempt >= max(1, _UNLINK_RETRIES):
+                break
+            time.sleep(_UNLINK_BACKOFF_S * attempt)
+    return last or "unknown error"
+
+
+def sweep_pending_deletes() -> dict:
+    """Retry every path parked by an earlier failed delete. Files that are now unlocked
+    are removed; the rest stay queued. Re-checks the path guard each time (the content
+    root may have moved) but NOT the DB — a queued path's row is already gone by
+    construction. Best-effort: never raises. Returns {removed, stillPending}."""
+    queued = _pending_load()
+    if not queued:
+        return {"removed": 0, "stillPending": 0}
+    removed, remaining = 0, []
+    for p in queued:
+        full, reason = _guard_path(p)
+        if full is None or reason is not None:
+            continue  # unsafe or empty -> drop from the queue, never delete
+        if not os.path.isfile(full):
+            continue  # already gone -> drop
+        err = _try_unlink(full)
+        if err is None:
+            removed += 1
+        else:
+            remaining.append(full)
+    _pending_save(remaining)
+    if removed or remaining:
+        print(f"[delete] pending sweep: removed {removed}, still locked {len(remaining)}")
+    return {"removed": removed, "stillPending": len(remaining)}
+
+
+def _remove_files(paths, *, protected: set[str] | None = None) -> tuple[list[str], list[str], list[str]]:
     """Unlink each path that passes the guards and is not still referenced.
 
     `protected` is the set of realpaths still pointed at by SURVIVING DB rows; any
     candidate matching one is skipped (kept) so a sibling job/video is not corrupted.
-    Returns (removed, skipped) as lists of realpaths.
+
+    Returns (removed, kept, locked) as lists of realpaths — three OUTCOMES, kept apart
+    on purpose because they mean opposite things to the owner:
+      • removed — gone from disk.
+      • kept    — deliberately NOT deleted: a surviving row still points at the file (the
+                  normal case for page-scoped per-scene audio shared by another video), or
+                  the path failed a guard. Nothing is wrong and nothing will be retried.
+      • locked  — a REAL failure: Windows refused the unlink (WinError 32/33) because some
+                  process holds the file open, so it was queued for a later sweep.
+    They used to be merged into one `skipped` list, and the dashboard reported the total as
+    "N tệp còn bị khoá trên đĩa" — so deleting a job whose audio a sibling video still uses
+    warned about 91 "locked" files while nothing was locked at all (job-291 report), and it
+    promised a retry-on-restart that must never happen for those files.
     """
     protected = protected or set()
     removed: list[str] = []
-    skipped: list[str] = []
+    kept: list[str] = []
+    locked: list[str] = []
     seen: set[str] = set()
     for p in paths:
         full, reason = _guard_path(p)
@@ -1482,22 +2365,27 @@ def _remove_files(paths, *, protected: set[str] | None = None) -> tuple[list[str
             continue
         seen.add(full)
         if reason is not None:
-            print(f"[delete] SKIP {full} ({reason})")
-            skipped.append(full)
+            print(f"[delete] KEEP {full} ({reason})")
+            kept.append(full)
             continue
         if full in protected:
-            print(f"[delete] SKIP {full} (still referenced by a surviving row)")
-            skipped.append(full)
+            print(f"[delete] KEEP {full} (still referenced by a surviving row)")
+            kept.append(full)
             continue
         if not os.path.isfile(full):
-            continue  # already gone — tolerated, not reported as removed/skipped
-        try:
-            os.remove(full)
+            continue  # already gone — tolerated, not reported as removed/kept/locked
+        err = _try_unlink(full)
+        if err is None:
             removed.append(full)
-        except OSError as exc:
-            print(f"[delete] SKIP {full} (unlink failed: {exc})")
-            skipped.append(full)
-    return removed, skipped
+        else:
+            # Could not unlink even after the retries — QUEUE it instead of losing it.
+            # The DB row still goes away (the owner asked for the delete), but the file
+            # is no longer forgotten: the next delete call and the next boot retry it.
+            print(f"[delete] LOCKED {full} (unlink failed after {_UNLINK_RETRIES} tries: {err})")
+            locked.append(full)
+    if locked:
+        _pending_save(_pending_load() + locked)
+    return removed, kept, locked
 
 
 def _remove_empty_dirs(dirs) -> None:
@@ -1547,12 +2435,68 @@ def _surviving_asset_paths(conn, *, exclude_video_ids: set[int]) -> set[str]:
     return protected
 
 
+def _remove_render_cache_dir(video_id: int) -> bool:
+    """Delete the ENTIRE render-cache dir _cache/renders/<video_id>/ (manifest +
+    all scene wav/visual files). Guarded to stay inside CONTENT_OUTPUT_ROOT.
+    Best-effort: NEVER raises. Returns True iff a directory was actually removed."""
+    try:
+        rdir = os.path.realpath(render_cache.render_dir(video_id))
+    except (ValueError, OSError):
+        return False
+    root = os.path.realpath(CONTENT_OUTPUT_ROOT)
+    renders_root = os.path.realpath(render_cache.renders_root())
+    # Only ever touch a path strictly inside <root>/_cache/renders/.
+    if not (rdir.startswith(renders_root + os.sep) and rdir.startswith(root + os.sep)):
+        return False
+    if not os.path.isdir(rdir):
+        return False
+    try:
+        shutil.rmtree(rdir)
+        return True
+    except OSError as exc:
+        print(f"[delete] SKIP render-cache dir {rdir} (rmtree failed: {exc})")
+        return False
+
+
+def _purge_render_cache_media(video_id: int) -> list[str]:
+    """Delete every scene wav/visual file INSIDE _cache/renders/<video_id>/ but KEEP
+    manifest.json, so the script stays reusable (script-only, no cached audio).
+    Guarded to stay inside the render-cache dir. Best-effort: NEVER raises.
+    Returns the basenames actually removed."""
+    try:
+        rdir = os.path.realpath(render_cache.render_dir(video_id))
+    except (ValueError, OSError):
+        return []
+    renders_root = os.path.realpath(render_cache.renders_root())
+    if not rdir.startswith(renders_root + os.sep) or not os.path.isdir(rdir):
+        return []
+    removed: list[str] = []
+    for name in os.listdir(rdir):
+        if name == render_cache.MANIFEST_NAME:
+            continue  # keep the manifest so the script survives
+        fp = os.path.join(rdir, name)
+        try:
+            if os.path.isfile(fp):
+                os.remove(fp)
+                removed.append(name)
+        except OSError:
+            pass  # best-effort
+    return removed
+
+
 @app.delete("/api/videos/{video_id}")
-def delete_video(video_id: int):
+def delete_video(video_id: int, keep_script: bool = Query(False, alias="keepScript")):
     """Delete a video: its DB row (cascades assets/posts) AND its files on disk.
 
     Shares the path-guarded remover with DELETE /api/jobs/{id}. A file referenced
     by another (surviving) video — e.g. page-scoped scene audio — is preserved.
+
+    Render-cache handling (_cache/renders/<video_id>/):
+      - keepScript FALSE (default): the ENTIRE render-cache dir is removed (manifest
+        + scene wav/visual files) — a full "delete everything".
+      - keepScript TRUE: the per-scene wav/visual files are removed but manifest.json
+        is KEPT, so the script stays reusable (script-only, no cached audio). The DB
+        video row is deleted either way.
     """
     with get_conn() as conn:
         v = conn.execute(
@@ -1565,12 +2509,57 @@ def delete_video(video_id: int):
 
     candidates = [v["video_path"], v["thumb_path"], v["audio_path"]] + [a["path"] for a in assets]
     clip_dirs = {os.path.dirname(a["path"]) for a in assets if a["path"]}
-    removed, skipped = _remove_files(candidates, protected=protected)
+    removed, kept, locked = _remove_files(candidates, protected=protected)
     _remove_empty_dirs(clip_dirs)
+
+    # Render cache: keep the manifest (script) or blow the whole dir away.
+    if keep_script:
+        purged = _purge_render_cache_media(video_id)
+        removed_renders_dir = False
+        kept_manifest = True
+    else:
+        purged = []
+        removed_renders_dir = _remove_render_cache_dir(video_id)
+        kept_manifest = False
 
     with get_conn() as conn:
         conn.execute("DELETE FROM videos WHERE id = %s", (video_id,))
-    return {"ok": True, "id": video_id, "removedFiles": removed, "skippedFiles": skipped}
+    # Opportunistic: retry anything an EARLIER delete had to defer (the lock has usually
+    # cleared by now). Cheap — a no-op when the queue is empty.
+    pending = sweep_pending_deletes()
+    return {
+        "ok": True,
+        "id": video_id,
+        "removedFiles": removed,
+        # THREE distinct outcomes — see _remove_files. `keptFiles` is NOT a problem (a
+        # surviving row still uses those files); only `lockedFiles` needs the owner's
+        # attention. `skippedFiles` is retained as their union for backward compatibility.
+        "keptFiles": kept,
+        "lockedFiles": locked,
+        "skippedFiles": kept + locked,
+        "removedRendersDir": removed_renders_dir,
+        "keptManifest": kept_manifest,
+        "purgedRenderCacheFiles": purged,
+        "pendingDeletes": pending["stillPending"],
+    }
+
+
+class VideoPatch(BaseModel):
+    title: str | None = None
+
+
+@app.patch("/api/videos/{video_id}")
+def patch_video(video_id: int, body: VideoPatch):
+    """Rename a video. Trims the title; an empty/whitespace title clears it (→ NULL).
+    Does NOT touch the render-cache manifest (the manifest title is the historical
+    snapshot; only videos.title is user-editable). 404 if the video is missing."""
+    new_title = (body.title or "").strip() or None
+    with get_conn() as conn:
+        row = conn.execute("SELECT id FROM videos WHERE id = %s", (video_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Video not found")
+        conn.execute("UPDATE videos SET title = %s WHERE id = %s", (new_title, video_id))
+    return {"ok": True, "videoId": video_id, "title": new_title}
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -1618,18 +2607,36 @@ def delete_job(job_id: int):
         if a["path"]:
             clip_dirs.add(os.path.dirname(a["path"]))
 
-    removed, skipped = _remove_files(candidates, protected=protected)
+    removed, kept, locked = _remove_files(candidates, protected=protected)
     _remove_empty_dirs(clip_dirs)
+
+    # Render cache: a job has NO per-script keep flag, so deleting a job FULLY purges
+    # each of its videos' _cache/renders/<video_id>/ dirs (manifest + scene files).
+    # Without this the manifests survive and resurface in reusable-scripts as
+    # source:'manifest' orphans (the bug this fixes).
+    removed_renders_dirs: list[int] = []
+    for vid in video_ids:
+        if _remove_render_cache_dir(vid):
+            removed_renders_dirs.append(vid)
 
     with get_conn() as conn:
         conn.execute("DELETE FROM jobs WHERE id = %s", (job_id,))
         remaining = conn.execute("SELECT count(*) AS n FROM jobs").fetchone()["n"]
 
+    # Opportunistic: retry anything an EARLIER delete had to defer (see above).
+    pending = sweep_pending_deletes()
     return {
         "deletedId": job_id,
         "removedFiles": removed,
-        "skippedFiles": skipped,
+        # THREE distinct outcomes — see _remove_files. `keptFiles` is NOT a problem (a
+        # surviving row still uses those files); only `lockedFiles` needs the owner's
+        # attention. `skippedFiles` is retained as their union for backward compatibility.
+        "keptFiles": kept,
+        "lockedFiles": locked,
+        "skippedFiles": kept + locked,
+        "removedRendersDirs": removed_renders_dirs,
         "remaining": int(remaining),
+        "pendingDeletes": pending["stillPending"],
     }
 
 
@@ -1754,7 +2761,7 @@ def retry_job(job_id: int):
             SELECT id, page_id, status, input_type, input_payload, voice, edit_mode,
                    comment, source_video_id, aspect, target_sec, add_credit,
                    render_model, voice_clone_model, src_audio_volume, publish,
-                   publish_platform, title, progress_step
+                   publish_platform, title, progress_step, llm_provider, llm_model
               FROM jobs WHERE id = %s
             """,
             (job_id,),
@@ -1782,23 +2789,33 @@ def retry_job(job_id: int):
         # Clone the job: same params, fresh 'queued' row. Mirrors create_job's INSERT.
         row = conn.execute(
             """
-            INSERT INTO jobs (page_id, input_type, input_payload, status,
+            INSERT INTO jobs (page_id, page_seq, input_type, input_payload, status,
                               voice, edit_mode, comment, source_video_id,
                               aspect, target_sec, add_credit, render_model, voice_clone_model,
                               src_audio_volume, publish, title, publish_platform,
-                              reuse_script_video_id, bypass_tts_cache)
-            VALUES (%s, %s, %s, 'queued', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                              reuse_script_video_id, bypass_tts_cache, bypass_script_cache,
+                              llm_provider, llm_model)
+            VALUES (%s,
+                    (SELECT COALESCE(MAX(page_seq), 0) + 1 FROM jobs WHERE page_id = %s),
+                    %s, %s, 'queued', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             # bypass_tts_cache is intentionally hardcoded FALSE on a resume/retry: a
             # plain resume should reuse cached TTS (the failure was downstream, not the
             # voice), so it must NOT implicitly force-fresh synth. Only an explicit
             # "Dùng lại kịch bản" create_job sets the bypass.
-            (job["page_id"], job["input_type"], job["input_payload"], job["voice"],
+            # bypass_script_cache intentionally FALSE on retry — fresh script not desired
+            # (a resume should reuse the cached script-gen; only an explicit create sets it).
+            (job["page_id"], job["page_id"], job["input_type"], job["input_payload"], job["voice"],
              job["edit_mode"], job["comment"], job["source_video_id"], job["aspect"],
              job["target_sec"], job["add_credit"], job["render_model"],
              job["voice_clone_model"], job["src_audio_volume"], job["publish"],
-             job["title"], job["publish_platform"], reuse_script_video_id, False),
+             job["title"], job["publish_platform"], reuse_script_video_id, False, False,
+             # The LLM choice IS carried over (unlike the two bypass flags above): a retry
+             # must re-run on the SAME backend the owner picked, otherwise a retry could
+             # silently switch providers — exactly the surprise the no-fallback rule exists
+             # to prevent. NULL stays NULL = claude-cli.
+             job["llm_provider"], job["llm_model"]),
         ).fetchone()
     return {
         "newJobId": row["id"],
@@ -1917,8 +2934,19 @@ class PublishBody(BaseModel):
     # accountIds, not platforms: multiple pages can each own a 'youtube', so a bare
     # platform string is ambiguous now — an account id pins the exact target.
     accountIds: list[int] = []
-    # Applies to Facebook Reels only; YouTube ignores it. Default DRAFT = safe.
-    state: str | None = None  # "PUBLISHED" | "DRAFT"
+    # Applies to Facebook only; YouTube ignores it. "PUBLISHED" = live now,
+    # "SCHEDULED" = auto-publish at scheduledPublishTime, "DRAFT" = unpublished.
+    state: str | None = None  # "PUBLISHED" | "SCHEDULED" | "DRAFT"
+    # Unix seconds; REQUIRED when state == "SCHEDULED" (Facebook only).
+    scheduledPublishTime: int | None = None
+    # Editable caption body. None => the server builds the legacy default (first
+    # scene narration). A string => used VERBATIM as the caption body, including
+    # "" (an intentionally blank body). The source credit is controlled SEPARATELY
+    # by includeSource — do NOT bake the "Nguồn: ..." line into this field.
+    description: str | None = None
+    # Whether to append the "Nguồn: <source>" credit (only has an effect when the
+    # video has a source_name). Default True = legacy behavior.
+    includeSource: bool = True
 
 
 @app.post("/api/videos/{video_id}/publish")
@@ -1936,15 +2964,275 @@ def publish_video(video_id: int, body: PublishBody):
     Response (PublishResponse): each result carries accountId + pageId (plus
     platform/ok/url/error/state) so the UI can show which page each result is for.
 
-    Validation/all-failed paths raise 422/404/409/400 (raised inside the core).
+    Validation/all-failed paths raise 422/404/400 (raised inside the core).
     Unknown/disconnected accountIds => 422 with a clear detail. Partial success is
-    preserved: one account failing does NOT abort the others.
+    preserved: one account failing does NOT abort the others. There is NO global
+    "already published" 409 gate — re-publishing is allowed; per-channel de-dup is
+    handled by the modal (hides channels that still have a posts row).
+
+    Gated by API_UPLOAD_ENABLED: while API publishing is disabled (auth blocked),
+    this returns 403 BEFORE touching the publish core so no upload is attempted.
     """
+    if not API_UPLOAD_ENABLED:
+        raise HTTPException(403, "Đăng qua API đang tạm tắt do vướng xác thực.")
     return publish_video_core(
         video_id,
         account_ids=body.accountIds,
-        state=(body.state or "DRAFT"),
+        state=(body.state or "PUBLISHED"),
+        scheduled_publish_time=body.scheduledPublishTime,
+        description=body.description,
+        include_source=body.includeSource,
     )
+
+
+class MarkPostedBody(BaseModel):
+    # Video ids the user is hand-marking as ALREADY uploaded to the platform OUTSIDE
+    # the API (manual upload). Only 'facebook' is supported for now.
+    videoIds: list[int] = []
+    platform: str = "facebook"
+
+
+@app.post("/api/videos/mark-posted")
+def mark_videos_posted(body: MarkPostedBody):
+    """Mark videos as MANUALLY posted to a platform (uploaded by hand, off-API).
+
+    For EACH videoId: resolve the video's OWN page (videos.page_id) → that page's
+    platform_accounts row for the platform → record a `posts` row with manual=TRUE,
+    status='posted', posted_at=now() and NULL platform_post_id/url (there is no API
+    object). Mirrors the real publish path's DB effect by flipping
+    videos.status='published'. Idempotent: a video that already has a posted post on
+    that account is treated as ok WITHOUT inserting a duplicate.
+
+    Only 'facebook' is supported now; any other platform is rejected (422).
+
+    Body:     { videoIds: [int, ...], platform: "facebook" }
+    Response:  { results: [ {videoId: int, ok: bool, error?: string} ... ] }
+    Per-video: one video's failure never fails the others (never global-fail).
+    """
+    platform = (body.platform or "").strip().lower()
+    if platform != "facebook":
+        raise HTTPException(
+            422, f"unsupported platform '{body.platform}' (only 'facebook' is supported)"
+        )
+
+    results: list[dict] = []
+    with get_conn() as conn:
+        for vid in body.videoIds:
+            v = conn.execute(
+                "SELECT id, page_id FROM videos WHERE id = %s", (vid,)
+            ).fetchone()
+            if not v:
+                results.append({"videoId": vid, "ok": False, "error": "Không tìm thấy video."})
+                continue
+            # The video's OWN page's Facebook channel (per-page account isolation).
+            acc = conn.execute(
+                """
+                SELECT id FROM platform_accounts
+                 WHERE page_id = %s AND platform = 'facebook'
+                 LIMIT 1
+                """,
+                (v["page_id"],),
+            ).fetchone()
+            if not acc:
+                results.append({
+                    "videoId": vid, "ok": False,
+                    "error": "Trang của video chưa liên kết kênh Facebook.",
+                })
+                continue
+            # Idempotent: skip the INSERT if this video already has a posted facebook
+            # post on that account (manual or real) — still report ok.
+            existing = conn.execute(
+                """
+                SELECT 1 FROM posts
+                 WHERE video_id = %s AND platform_account_id = %s
+                   AND platform = 'facebook' AND status = 'posted'
+                 LIMIT 1
+                """,
+                (vid, acc["id"]),
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    """
+                    INSERT INTO posts (video_id, platform_account_id, platform,
+                                       platform_post_id, url, status, manual, posted_at)
+                    VALUES (%s, %s, 'facebook', NULL, NULL, 'posted', TRUE, now())
+                    """,
+                    (vid, acc["id"]),
+                )
+            # Mirror the real publish path: a successful (manual) post publishes the video.
+            conn.execute("UPDATE videos SET status = 'published' WHERE id = %s", (vid,))
+            results.append({"videoId": vid, "ok": True})
+
+    return {"results": results}
+
+
+@app.get("/api/videos/{video_id}/publish-progress")
+def publish_progress(video_id: int, platform: str = "facebook"):
+    """Poll the live upload progress for a video's in-flight publish (cheap; dict
+    lookup, no DB). Powers the FE % bar during the slow chunked Facebook feed upload.
+
+    Query: platform (default "facebook"). Key = f"{video_id}:{platform}".
+    Returns:
+      - in flight / recently finished:
+        { active: true, phase: "start|transfer|finish|done|error",
+          pct: 0..100, bytesSent: int, bytesTotal: int }
+      - no entry (never started, or evicted ~30s after done/error):
+        { active: false }
+    Note: feed progress advances per ~8MiB chunk (~60 updates for a 296MB file);
+    reels are coarse (start -> done)."""
+    entry = facebook_upload.get_upload_progress(f"{video_id}:{platform}")
+    if not entry:
+        return {"active": False}
+    return {
+        "active": True,
+        "phase": entry.get("phase"),
+        "pct": entry.get("pct", 0.0),
+        "bytesSent": entry.get("bytesSent", 0),
+        "bytesTotal": entry.get("bytesTotal", 0),
+    }
+
+
+@app.delete("/api/videos/{video_id}/posts")
+def unpublish_video_from_page(video_id: int, page_id: int = Query(..., alias="pageId")):
+    """Remove a video FROM one page's "Products" block by deleting ONLY the local
+    `posts` rows that tie this video to that page's platform_account(s).
+
+    This does NOT call any platform delete API — nothing is removed on Facebook (or
+    anywhere else). It only detaches the video from that page locally. It is also
+    DISTINCT from DELETE /api/videos/{id} (which deletes the local file + the videos
+    row and cascades posts): here the local file, the `videos` row, assets, and the
+    render cache are all left untouched, so the video stays reusable.
+
+    A post's page is derived via platform_account_id -> platform_accounts.page_id
+    (posts has NO page_id). So we target exactly the posts of THIS video whose
+    account belongs to `pageId` — those are the ones that make the video appear in
+    that page's Products block — regardless of platform.
+
+    After removal, if the video has NO remaining posted posts anywhere, its status is
+    reset from 'published' back to 'ready' so it does not linger as published with no
+    posts (the origin page keeps showing it via its own page_id, now as 'ready').
+
+    Response: { ok: true, videoId, pageId, removed: <n> }  (n = rows removed).
+    """
+    with get_conn() as conn:
+        removed_rows = conn.execute(
+            """
+            DELETE FROM posts
+             WHERE id IN (
+               SELECT po.id
+                 FROM posts po
+                 JOIN platform_accounts pa ON pa.id = po.platform_account_id
+                WHERE po.video_id = %s AND pa.page_id = %s
+             )
+            RETURNING id
+            """,
+            (video_id, page_id),
+        ).fetchall()
+        removed = len(removed_rows)
+        if removed == 0:
+            # Vietnamese detail (surfaces in the dashboard).
+            raise HTTPException(
+                404,
+                "Không có bài đăng nào của video này trên trang đó (no posts for this video on that page).",
+            )
+        # If nothing posted remains anywhere, drop the 'published' label back to
+        # 'ready' so the video doesn't linger as published with no posts.
+        remaining = conn.execute(
+            "SELECT count(*) AS n FROM posts WHERE video_id = %s AND status = 'posted'",
+            (video_id,),
+        ).fetchone()
+        if remaining and remaining["n"] == 0:
+            conn.execute(
+                "UPDATE videos SET status = 'ready' WHERE id = %s AND status = 'published'",
+                (video_id,),
+            )
+
+    return {"ok": True, "videoId": video_id, "pageId": page_id, "removed": removed}
+
+
+@app.get("/api/videos/{video_id}/publish-preflight")
+def publish_preflight(video_id: int):
+    """Per-platform preflight for the publish modal: given THIS video's shape
+    (aspect ratio / duration), tell how each platform will treat it, so the modal
+    can show a column per platform with video-specific info. Path-only ffprobe on
+    the local file — no creds, no network. The Facebook decision is the exact one
+    publish uses (facebook_upload.decide_mode); YouTube's Short-vs-video hint
+    mirrors the Shorts rule (vertical/square AND <= 180s)."""
+    with get_conn() as conn:
+        v = conn.execute(
+            "SELECT video_path, script, source_name, source_link FROM videos WHERE id = %s",
+            (video_id,),
+        ).fetchone()
+    if not v:
+        raise HTTPException(404, "Video not found")
+    if not v["video_path"] or not os.path.isfile(v["video_path"]):
+        raise HTTPException(422, "Video file not found on disk")
+
+    # Default caption BODY only (first scene narration) — WITHOUT the "Nguồn:"
+    # credit, which the modal toggles separately via includeSource. Lets the modal
+    # prefill an editable field and decide whether to show the source toggle.
+    scenes = v["script"] or []
+    default_description = scenes[0].get("narration", "") if scenes else ""
+
+    d = facebook_upload.decide_mode(v["video_path"])
+    info = d.get("info", {})
+    w = int(info.get("width") or 0)
+    h = int(info.get("height") or 0)
+    dur = info.get("duration")
+    # YouTube Short: vertical or square AND <= 180s; otherwise a normal video.
+    vertical_or_square = h > 0 and h >= w
+    yt_short = bool(vertical_or_square and dur is not None and dur <= 180)
+
+    # Where this video has ALREADY been posted (draft or live), so the modal can
+    # flag "already on <platform>" up front. Source of truth is the posts table
+    # (videos.status only flips to 'published' on a real public go-live, so a
+    # facebook DRAFT would not show there — posts does).
+    with get_conn() as conn:
+        post_rows = conn.execute(
+            """
+            SELECT po.platform, po.status, po.platform_post_id, po.url, po.posted_at,
+                   pa.page_id, pa.id AS account_id, p.name AS page_name
+              FROM posts po
+              JOIN platform_accounts pa ON pa.id = po.platform_account_id
+              JOIN pages p ON p.id = pa.page_id
+             WHERE po.video_id = %s
+             ORDER BY po.posted_at DESC
+            """,
+            (video_id,),
+        ).fetchall()
+    posts = [
+        {
+            "platform": r["platform"],
+            "status": r["status"],                    # 'posted' | 'draft'
+            "postId": r["platform_post_id"],
+            "url": r["url"],
+            "postedAt": r["posted_at"].isoformat() if r["posted_at"] else None,
+            "pageId": r["page_id"],
+            "accountId": r["account_id"],
+            "pageName": r["page_name"],
+        }
+        for r in post_rows
+    ]
+
+    return {
+        "width": w or None,
+        "height": h or None,
+        "duration": dur,
+        "aspectRatio": info.get("aspect_ratio"),
+        "facebook": {
+            "mode": d["mode"],                   # "reel" | "feed"
+            "reelOk": d.get("reel_ok", False),
+            "reelReason": d.get("reel_reason"),  # why NOT a reel (when mode == feed)
+        },
+        "youtube": {
+            "mode": "short" if yt_short else "video",
+        },
+        "posts": posts,
+        # Editable-caption support for the publish modal:
+        "defaultDescription": default_description,   # body only, no "Nguồn:" credit
+        "sourceName": v["source_name"] or None,
+        "sourceLink": v["source_link"] or None,
+    }
 
 
 # Aspect ratios the clone re-assemble accepts. Derived from the runner's ASPECTS
@@ -2017,11 +3305,13 @@ def clone_video(video_id: int, body: CloneBody):
     with get_conn() as conn:
         job = conn.execute(
             """
-            INSERT INTO jobs (page_id, input_type, input_payload, status, aspect, clone_of_video_id)
-            VALUES (%s, 'clone', %s, 'queued', %s, %s)
+            INSERT INTO jobs (page_id, page_seq, input_type, input_payload, status, aspect, clone_of_video_id)
+            VALUES (%s,
+                    (SELECT COALESCE(MAX(page_seq), 0) + 1 FROM jobs WHERE page_id = %s),
+                    'clone', %s, 'queued', %s, %s)
             RETURNING id
             """,
-            (v["page_id"], f"clone of video {video_id}", aspect, video_id),
+            (v["page_id"], v["page_id"], f"clone of video {video_id}", aspect, video_id),
         ).fetchone()
         new_video = conn.execute(
             "INSERT INTO videos (job_id, page_id, status) VALUES (%s, %s, 'rendering') RETURNING id",
@@ -2042,4 +3332,77 @@ def bootstrap():
             "analytics": fetch_analytics(conn),
             "org": fetch_org(conn),
         }
+
+
+# ===========================================================================
+# Static SPA hosting — serve the built frontend same-origin so runtime Vite is
+# gone. FE fetches use RELATIVE paths (/api, /generate, /media), so hosting the
+# built bundle from this origin needs NO base-URL change on the web side.
+#
+# Registration order matters: this block runs at import time AFTER every router
+# and every @app route above, so FastAPI matches all real API routes FIRST and
+# the catch-all only answers what nothing else claimed. The catch-all also
+# explicitly refuses the API prefixes so an unknown /api/* path 404s as an API
+# path (not as a silently-served index.html).
+#
+# Dev flow is untouched: if dist/ is absent (no build yet) this whole block is
+# skipped, so run-api.ps1 + Vite :5173 still boot exactly as before. The dist
+# location is resolved relative to this file and overridable via WEB_DIST_DIR.
+# ===========================================================================
+from pathlib import Path as _Path  # noqa: E402
+from fastapi.staticfiles import StaticFiles as _StaticFiles  # noqa: E402
+
+_WEB_DIST_DIR = _Path(
+    os.getenv("WEB_DIST_DIR") or (_Path(__file__).resolve().parent.parent / "web" / "dist")
+).resolve()
+
+# Path prefixes owned by the API/server — the SPA catch-all must never answer
+# these (an unknown one should 404 as an API path, not fall back to index.html).
+_API_PREFIXES = ("/api", "/generate", "/media", "/docs", "/redoc", "/openapi.json")
+
+if (_WEB_DIST_DIR / "index.html").is_file():
+    _INDEX_HTML = str(_WEB_DIST_DIR / "index.html")
+
+    # Hashed, content-addressed build assets (JS/CSS/fonts). Mounted (not routed)
+    # so it is matched ahead of the catch-all and 404s cleanly on a missing hash.
+    _assets_dir = _WEB_DIST_DIR / "assets"
+    if _assets_dir.is_dir():
+        app.mount("/assets", _StaticFiles(directory=str(_assets_dir)), name="spa-assets")
+
+    # index.html must NEVER be cached. It is the only file whose NAME is stable while its
+    # CONTENT changes on every build (it carries the hashed asset URLs), and the response
+    # used to ship with just ETag/Last-Modified and no Cache-Control — which lets a browser
+    # reuse it heuristically without revalidating. The tab then keeps loading the OLD
+    # index.html, whose OLD hashed bundle is also still in the browser cache, so a rebuilt
+    # dashboard silently keeps running the previous code: the "I rebuilt and my fix still
+    # isn't there" trap (hit on the delete-toast fix). The hashed assets under /assets are
+    # content-addressed and stay cacheable — only the shell is forced to revalidate.
+    _NO_STORE = {"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"}
+
+    @app.get("/{full_path:path}")
+    def _spa_catch_all(full_path: str):
+        """SPA fallback: serve a real dist file if the path maps to one, else
+        index.html for client-side routing. Refuses API prefixes so they 404
+        as API paths instead of being masked by index.html."""
+        p = "/" + full_path
+        for pre in _API_PREFIXES:
+            if p == pre or p.startswith(pre + "/"):
+                raise HTTPException(status_code=404, detail="Not found")
+        # Real static file under dist (favicon, logos/, robots.txt, …)?
+        if full_path:
+            candidate = (_WEB_DIST_DIR / full_path).resolve()
+            # Traversal guard: candidate must stay inside dist.
+            if candidate.is_file() and candidate.is_relative_to(_WEB_DIST_DIR):
+                # An unhashed dist file (favicon, logo, robots.txt) can also be replaced by
+                # a rebuild under the same name, so it gets the same no-store treatment.
+                return FileResponse(str(candidate), headers=_NO_STORE)
+        # Otherwise it's an SPA client route → hand back the shell.
+        return FileResponse(_INDEX_HTML, headers=_NO_STORE)
+
+    print(f"[web] Serving built SPA from {_WEB_DIST_DIR}")
+else:
+    print(
+        f"[web] dist not found at {_WEB_DIST_DIR} — SPA not served "
+        f"(dev-only mode; run Vite on :5173). Build with `npm run build` in Dashboard/web."
+    )
 

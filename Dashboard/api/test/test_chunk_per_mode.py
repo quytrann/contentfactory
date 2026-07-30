@@ -4,8 +4,8 @@ WHAT THIS COVERS
 ----------------
 The script-gen splitter now picks its per-batch chunk size by edit mode instead of
 one global constant. Summary keeps near-verbatim Vietnamese text (densest decode) so
-it gets a SMALLER chunk (10); recap 12; commentary/educational 16; anything unknown
-or None falls back to the global SCRIPT_GEN_CHUNK_SCENES (18). The pieces under test:
+it gets a SMALLER chunk (19); recap 15; commentary/educational 20; anything unknown
+or None falls back to the global SCRIPT_GEN_CHUNK_SCENES (23). The pieces under test:
 
   _chunk_for_mode(edit_mode) -> int      # mode -> chunk, case-insensitive, fallback 18
   _batch_count(scene_count, chunk)       # ceil(scene_count / chunk), >= 1
@@ -42,10 +42,10 @@ import generate  # noqa: E402
 # Each tuple: (edit_mode, expected_chunk, expected_batches) for scene_count=71.
 _SCENES = 71
 _MODE_CASES = [
-    ("summary", 10, 8),       # ceil(71/10) = 8
-    ("recap", 12, 6),         # ceil(71/12) = 6
-    ("commentary", 16, 5),    # ceil(71/16) = 5
-    ("educational", 16, 5),   # ceil(71/16) = 5
+    ("summary", 19, 4),       # ceil(71/19) = 4  (chunk sizes +25%, 2026-06-28 perf pass)
+    ("recap", 15, 5),         # ceil(71/15) = 5
+    ("commentary", 20, 4),    # ceil(71/20) = 4
+    ("educational", 20, 4),   # ceil(71/20) = 4
 ]
 
 
@@ -77,16 +77,16 @@ def test_summary_split_exact_shape():
 
 def test_unknown_mode_falls_back_to_global_chunk():
     """An unrecognized mode string ('xyz') falls back to the global SCRIPT_GEN_CHUNK_SCENES
-    (18 by default) -> ceil(71/18) = 4 batches."""
+    (23 by default) -> ceil(71/23) = 4 batches."""
     assert generate._chunk_for_mode("xyz") == generate.SCRIPT_GEN_CHUNK_SCENES
-    assert generate._chunk_for_mode("xyz") == 18
+    assert generate._chunk_for_mode("xyz") == 23
     assert generate._batch_count(_SCENES, generate._chunk_for_mode("xyz")) == 4
 
 
 def test_none_mode_falls_back_to_global_chunk():
     """None mode (topic-only / no editMode) falls back to the global chunk -> 4 batches."""
     assert generate._chunk_for_mode(None) == generate.SCRIPT_GEN_CHUNK_SCENES
-    assert generate._chunk_for_mode(None) == 18
+    assert generate._chunk_for_mode(None) == 23
     assert generate._batch_count(_SCENES, generate._chunk_for_mode(None)) == 4
 
 
@@ -99,12 +99,12 @@ def test_empty_string_mode_falls_back_to_global_chunk():
 def test_chunk_for_mode_case_insensitivity(variant):
     """Mode lookup is case-insensitive (lowercased). NOTE: leading/trailing spaces are
     NOT stripped by the helper, so ' summary ' is expected to MISS and fall back to the
-    global chunk — only the cased variants resolve to 10. This documents real behavior."""
+    global chunk — only the cased variants resolve to 19. This documents real behavior."""
     if variant.strip() != variant:
         # Whitespace is not stripped -> falls back to global chunk.
         assert generate._chunk_for_mode(variant) == generate.SCRIPT_GEN_CHUNK_SCENES
     else:
-        assert generate._chunk_for_mode(variant) == 10
+        assert generate._chunk_for_mode(variant) == 19
 
 
 def test_batch_count_degenerate_single_call():
@@ -187,7 +187,7 @@ class _ScrambledFinishStub:
         assert m is not None, "prompt missing #IDX=..# marker"
         return int(m.group(1))
 
-    def __call__(self, prompt, timeout=None):
+    def __call__(self, prompt, timeout=None, cache_parts=None, batch_idx=0):
         with self._lock:
             self.in_flight += 1
             self.peak = max(self.peak, self.in_flight)
@@ -254,16 +254,17 @@ def test_env_override_via_importlib_reload(monkeypatch):
         )
         assert generate._chunk_for_mode("summary") == 7
         # Other modes still at their defaults (env did not touch them).
-        assert generate.SCRIPT_GEN_CHUNK_BY_MODE["recap"] == 12
-        assert generate.SCRIPT_GEN_CHUNK_BY_MODE["commentary"] == 16
+        assert generate.SCRIPT_GEN_CHUNK_BY_MODE["recap"] == 15
+        assert generate.SCRIPT_GEN_CHUNK_BY_MODE["commentary"] == 20
     finally:
-        # Restore the pristine module so later tests/imports see default 10 for summary.
+        # Restore the pristine module so later tests/imports see default 19 for summary.
         monkeypatch.delenv("SCRIPT_GEN_CHUNK_SCENES_SUMMARY", raising=False)
         importlib.reload(generate)
 
-    # After reload-without-env, the default is back.
-    assert generate.SCRIPT_GEN_CHUNK_BY_MODE["summary"] == 10
-    assert generate._chunk_for_mode("summary") == 10
+    # After reload-without the monkeypatched override, the value comes from the live
+    # .env (loaded by conftest into os.environ) = 19, the 2026-06-28 summary default.
+    assert generate.SCRIPT_GEN_CHUNK_BY_MODE["summary"] == 19
+    assert generate._chunk_for_mode("summary") == 19
 
 
 def test_module_attr_override_is_picked_up(monkeypatch):

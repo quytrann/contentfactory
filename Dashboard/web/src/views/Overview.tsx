@@ -196,7 +196,7 @@ export default function Overview({ onOpenPage }: { onOpenPage: (id: number) => v
                       </button>
                       {v.jobId != null && (
                         <span className="rounded bg-panel2 px-1.5 py-0.5 font-mono text-[10px] text-muted">
-                          job #{v.jobId}
+                          job #{JOBS.find((j) => j.id === v.jobId)?.pageSeq ?? v.jobId}
                         </span>
                       )}
                     </div>

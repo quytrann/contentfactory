@@ -53,7 +53,7 @@ export default function PageDetail({ pageId, onBack }: { pageId: number; onBack:
       <PageTraffic analytics={analytics} />
 
       {/* Products — videos published into this page's channels */}
-      <Products pageName={page.name} videos={videos} />
+      <Products pageId={pageId} pageName={page.name} videos={videos} />
     </div>
   )
 }
@@ -69,12 +69,28 @@ function PageTraffic({ analytics }: { analytics: PageAnalytics | null }) {
   }))
   const monthly = (analytics?.viewsMonthly ?? []).map((d) => ({ month: d.month.slice(5), value: d.value }))
   const isEmpty = analytics !== null && slices.length === 0 && monthly.length === 0
+  // Follower/like counts: null (unavailable) → "—".
+  const fmtCount = (n: number | null | undefined) => (n == null ? '—' : n.toLocaleString('vi-VN'))
 
   return (
     <Card className="p-5">
       <SectionTitle sub="Lưu lượng của kênh này — phân bổ theo nền tảng và lượt xem theo tháng.">
         Phân tích lưu lượng
       </SectionTitle>
+      {/* Follower / like stat tiles — shown once analytics load (even if the
+          charts below have no data yet). */}
+      {analytics !== null && (
+        <div className="mb-4 grid max-w-md grid-cols-2 gap-3">
+          <div className="rounded-xl border border-line bg-panel2/50 px-4 py-3">
+            <div className="text-xs text-muted">Người theo dõi</div>
+            <div className="mt-0.5 text-xl font-semibold tabular-nums text-fg">{fmtCount(analytics.followers)}</div>
+          </div>
+          <div className="rounded-xl border border-line bg-panel2/50 px-4 py-3">
+            <div className="text-xs text-muted">Lượt thích</div>
+            <div className="mt-0.5 text-xl font-semibold tabular-nums text-fg">{fmtCount(analytics.fanCount)}</div>
+          </div>
+        </div>
+      )}
       {analytics === null ? (
         <div className="flex h-44 items-center justify-center text-muted">
           <Loader2 className="h-5 w-5 animate-spin" />
@@ -104,7 +120,7 @@ function PageTraffic({ analytics }: { analytics: PageAnalytics | null }) {
 // ---- Products ----------------------------------------------------------
 
 // Finished products = preview grid (like the Videos menu), PUBLISHED-only for this channel.
-function Products({ pageName, videos }: { pageName: string; videos: Video[] }) {
+function Products({ pageId, pageName, videos }: { pageId: number; pageName: string; videos: Video[] }) {
   const [status, setStatus] = useState<'all' | VideoStatus>('all')
   const [playing, setPlaying] = useState<Video | null>(null)
   // Match Videos.tsx landscapeOf: prefer the real frame size; when dims are
@@ -120,7 +136,7 @@ function Products({ pageName, videos }: { pageName: string; videos: Video[] }) {
       </SectionTitle>
       <div className="mb-3 flex items-center gap-2">
         <span className="shrink-0 text-xs text-muted">Lọc trạng thái:</span>
-        <Select value={status} onChange={(v) => setStatus(v as 'all' | VideoStatus)} className="w-52">
+        <Select value={status} onChange={(v) => setStatus(v as 'all' | VideoStatus)} className="w-52" settingKey="videos.statusFilter" autoApplyDefault>
           <option value="all">Tất cả ({videos.length})</option>
           <option value="ready">Sẵn sàng ({count('ready')})</option>
           <option value="published">Đã đăng ({count('published')})</option>
@@ -133,7 +149,7 @@ function Products({ pageName, videos }: { pageName: string; videos: Video[] }) {
       ) : (
         <div className="grid grid-cols-3 gap-2.5 sm:grid-cols-4 lg:grid-cols-7 2xl:grid-cols-8">
           {filtered.map((v) => (
-            <VideoCard key={v.id} v={v} landscape={land(v)} pageName={pageName} onPlay={setPlaying} />
+            <VideoCard key={v.id} v={v} landscape={land(v)} pageName={pageName} onPlay={setPlaying} variant="page" pageId={pageId} />
           ))}
         </div>
       )}

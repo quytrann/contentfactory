@@ -1,7 +1,7 @@
 // Thin client for the dashboard's write/generation endpoints (proxied to :4000).
 // Reads still flow through DataProvider/useData; these are the mutations.
 
-import type { AllLinkedChannelsResponse, Job, LinkedChannelsResponse, PageAnalytics, PlatformSpecsResponse, PublishResponse } from './types'
+import type { AllLinkedChannelsResponse, BatchCreateBody, BatchCreateResponse, BatchPreviewResponse, Job, LinkedChannelsResponse, MarkPostedResponse, PageAnalytics, PlatformSpecsResponse, PublishPreflight, PublishResponse, RemoveFromPageResult, SystemStats, TagsRequest, TagsResponse } from './types'
 
 // An Error that also carries the HTTP status and the parsed `detail` body, so
 // callers (e.g. the publish modal) can branch on 400/404/409/422/429 and read a
@@ -41,8 +41,45 @@ const JSON_HEADERS = { 'Content-Type': 'application/json' }
 export interface DeleteResult {
   deletedId: number
   removedFiles: string[]
+  // Deliberately NOT deleted: a SURVIVING row still points at these (the normal case for
+  // page-scoped per-scene audio a sibling video also uses). Not a problem, never retried.
+  keptFiles?: string[]
+  // The real failure: the OS refused the unlink because a process holds the file open.
+  // Queued and retried on the next delete / at API startup.
+  lockedFiles?: string[]
+  // Union of keptFiles + lockedFiles. Kept for compatibility — do NOT show it as
+  // "locked": doing so reported 91 shared audio files as locked when none were.
   skippedFiles: string[]
   remaining: number
+  // Files the backend could NOT unlink (almost always still open — e.g. this very
+  // dashboard is streaming the mp4 into a <video> preview). The DB row is gone but the
+  // file is queued and retried on the next delete and at API startup. Surface it, or
+  // the owner never learns the disk kept growing.
+  pendingDeletes?: number
+}
+
+// DELETE /api/videos/{id} success shape (differs from DeleteResult, which fits
+// job deletes). removedRendersDir/keptManifest/purgedRenderCacheFiles reflect the
+// keepScript branch: keepScript=true keeps manifest.json (keptManifest=true) and
+// lists the per-scene media it purged; keepScript=false removes the whole renders dir.
+export interface VideoDeleteResult {
+  ok: boolean
+  id: number
+  removedFiles: string[]
+  // Deliberately NOT deleted: a SURVIVING row still points at these (the normal case for
+  // page-scoped per-scene audio a sibling video also uses). Not a problem, never retried.
+  keptFiles?: string[]
+  // The real failure: the OS refused the unlink because a process holds the file open.
+  // Queued and retried on the next delete / at API startup.
+  lockedFiles?: string[]
+  // Union of keptFiles + lockedFiles. Kept for compatibility — do NOT show it as
+  // "locked": doing so reported 91 shared audio files as locked when none were.
+  skippedFiles: string[]
+  removedRendersDir: boolean
+  keptManifest: boolean
+  purgedRenderCacheFiles: string[]
+  // See DeleteResult.pendingDeletes.
+  pendingDeletes?: number
 }
 
 export interface NewJobBody {
@@ -59,6 +96,12 @@ export interface NewJobBody {
   srcAudioVolume?: number         // 0 (off, default) | 0.05 | 0.10 | 0.15 — keep a little of the source's original audio under the VN voiceover
   renderModel?: string | null     // render/animation engine key (see RENDER_MODELS)
   voiceCloneModel?: string | null  // voice-clone engine key (see VOICE_CLONE_MODELS)
+  // Script-gen LLM routing (option list from GET /api/llm/models). `llmModel` is
+  // null for providers that have no model id of their own (e.g. claude-cli).
+  // BOTH are OMITTED when the owner keeps the backend's default option, so a
+  // default job's payload stays identical to the pre-feature one.
+  llmProvider?: string | null
+  llmModel?: string | null
   publish?: boolean               // auto-upload after the job finishes (default false = manual publish later)
   publishPlatform?: string | null // when publish=true, the platform to auto-upload to ('youtube'|'tiktok'|'instagram'|'facebook'); null = don't auto-publish
   // PART B (script cache reuse): when set, the backend SKIPS script-generation and
@@ -70,6 +113,21 @@ export interface NewJobBody {
   //           the reused script text was edited so cached audio no longer matches.
   //   false / omit → let the TTS cache serve existing audio (cache HIT skips the GPU).
   bypassTtsCache?: boolean
+  // Script cache control: only meaningful on jobs that RUN script-gen (i.e. NOT the
+  // reuseScriptVideoId path, which skips script-gen entirely).
+  //   true  → force script-gen to skip the disk-cache READ (fresh Claude headless
+  //           call). The fresh result is still WRITTEN back to the cache.
+  //   false / omit → let the script cache serve an existing result if present.
+  bypassScriptCache?: boolean
+  // Cover image (thumbnail) control. When useCover is true, the assembly step
+  // uses the AI-generated cover (at coverImagePath) as the video's poster/
+  // thumbnail instead of an extracted frame (not burned into the video stream).
+  // coverImagePath is the disk path returned by POST /generate/cover.
+  useCover?: boolean
+  coverImagePath?: string | null
+  // Final, edited copy-ready Facebook hashtag string (generated + tweaked in the
+  // Studio). null/omit = no tags. Persisted with the produced video.
+  facebookTags?: string | null
 }
 
 // GET /api/pages/{pageId}/reusable-scripts?link=<optional> → ReusableScript[].
@@ -82,15 +140,47 @@ export interface ReusableScript {
   sourceLink: string | null
   sourceName: string | null
   renderMode: string | null   // 'footage' | 'image' | 'stickman' — the mode the script was authored for
-  editMode: string | null     // 'commentary' | 'recap' | 'educational' | 'summary' | 'dubbed'
+  editMode: string | null     // 'commentary' | 'recap' | 'educational' | 'summary' | 'dubbed' | 'translate_full'
   sceneCount: number
   preview: string | null
-  createdAt: string
+  createdAt: string | null    // null for 'manifest'-source items (no DB row to date it)
+  // Reuse-audio hints (backend contract):
+  //   audioCached — a cached WAV set exists → reusing WITH audio is possible.
+  //   audioStale  — the script text was edited AFTER the cache was made (a prior
+  //                 session), so reusing WITH audio would serve mismatched audio.
+  //   source      — 'db' (script lives in the DB) | 'manifest' (only a render
+  //                 manifest on disk; these never have a reusable audio cache).
+  audioCached: boolean
+  audioStale: boolean
+  source: 'db' | 'manifest'
+}
+
+// POST /generate/cover → CoverResult. Generates an AI cover/thumbnail image for a
+// title. `url` is a ready-to-use /media?path=… src; `path` is the disk path to
+// pass back as NewJobBody.coverImagePath when the owner opts to use the cover.
+export interface CoverResult {
+  path: string
+  url: string
+  seed: number
+  styleIndex: number
+  // Present ONLY on the generate-progress `result` (GET /generate/cover/progress):
+  //   basePath — the CLEAN (title-less) image; the compositing base every
+  //              renderCoverTitle call re-renders from (so it never stacks).
+  //   viTitle  — the auto-translated Vietnamese title; prefilled into the editable
+  //              title input so the owner can tweak it before applying.
+  //   keyWords — key phrases the backend highlights when it fancy-styles the title.
+  // Omitted on the renderCoverTitle response (which only echoes path/url).
+  basePath?: string
+  viTitle?: string
+  keyWords?: string[]
 }
 
 // GET /api/videos/{videoId}/script → VideoScriptDetail. The full saved script for
-// the "Xem trước" expansion. Footage scenes carry sourceStart/sourceEnd; image/
-// stickman scenes carry image_prompt — so a script is mode-specific.
+// the "Xem trước" expansion. The response is a discriminated union on `kind`:
+//   - kind === 'scenes' → a scene-array script (image/footage/stickman). Footage
+//     scenes carry sourceStart/sourceEnd; image/stickman scenes carry image_prompt.
+//   - kind === 'dubbed' → a Dubbed job's transcript, stored as timestamped VN
+//     subtitles (no scene array). 404 still means genuinely no script.
 export interface VideoScriptScene {
   scene: number
   narration: string
@@ -98,13 +188,39 @@ export interface VideoScriptScene {
   sourceStart?: number
   sourceEnd?: number
 }
-export interface VideoScriptDetail {
+
+// One dubbed subtitle line (kind === 'dubbed'). start/end are seconds from the
+// source; text_vi is the Vietnamese dubbed line for that span.
+export interface DubbedSub {
+  start: number
+  end: number
+  text_vi: string
+}
+
+// Common fields on every script-detail response, regardless of kind.
+interface VideoScriptBase {
   videoId: number
   title: string | null
   renderMode: string | null
+  editMode: string | null
+}
+
+export interface VideoScriptScenes extends VideoScriptBase {
+  kind: 'scenes'
   sceneCount: number
   scenes: VideoScriptScene[]
 }
+
+export interface VideoScriptDubbed extends VideoScriptBase {
+  kind: 'dubbed'
+  subCount: number
+  subs: DubbedSub[]
+}
+
+// Discriminated union: narrow on `kind` before touching scenes/subs. A legacy API
+// response that omits `kind` fails the `kind === 'dubbed'` check at runtime and is
+// treated as the scenes branch (backward-safe).
+export type VideoScriptDetail = VideoScriptScenes | VideoScriptDubbed
 
 export interface LinkProbe {
   title: string | null
@@ -150,6 +266,30 @@ export interface ResumeJobResult {
   creditDecision: 'provided' | 'skipped'
 }
 
+// ---- Script-gen LLM options (GET /api/llm/models) ---------------------------
+// The providers/models the backend can route script generation to. NOTE: this is
+// the one endpoint whose payload is snake_case (`is_default` / `generated_at`) —
+// mirrored verbatim here rather than renamed, so the type matches the wire.
+//
+// Contract notes that matter to the UI:
+//   - `claude-cli` is always present and is normally the `is_default` row.
+//   - gemini/openrouter rows appear ONLY when the backend has a key for them, so a
+//     one-option list is a valid response, not an error state.
+//   - `reliability: 'low'` = experimental free-tier model that often fails to
+//     finish within budget; the dropdown flags it so it can't be picked blindly.
+export interface LlmModelOption {
+  provider: string
+  model: string | null
+  label: string
+  is_default: boolean
+  reliability: 'high' | 'low'
+  notes?: string | null
+}
+export interface LlmModelsResponse {
+  options: LlmModelOption[]
+  generated_at?: string
+}
+
 export interface NewPageBody {
   name: string
   language?: string
@@ -164,10 +304,137 @@ export const api = {
   createJob: (body: NewJobBody): Promise<{ id: number; status: string }> =>
     fetch('/api/jobs', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) }).then(jsonOrThrow),
 
+  // Generate Facebook hashtags for a video title. Returns the individual tags plus
+  // a copy-ready `text` (tags joined by spaces). The owner edits `text` in the
+  // Studio and sends the final string back on create as NewJobBody.facebookTags.
+  generateTags: (body: TagsRequest): Promise<TagsResponse> =>
+    fetch('/generate/tags', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) }).then(jsonOrThrow),
+
+  // Batch "Add List" — side-effect-free preview: auto-translate each link's title
+  // to Vietnamese so the owner can review/edit before creating jobs. Order matches
+  // the input links; each row is either {originalTitle, viTitle} or {error}. Empty
+  // links → 422; capped at 30 links → 422 (both with a Vietnamese detail).
+  batchPreview: (links: string[]): Promise<BatchPreviewResponse> =>
+    fetch('/api/jobs/batch/preview', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ links }) }).then(jsonOrThrow),
+
+  // Batch "Add List" — create one queued job per item (runner processes them
+  // sequentially). `items` carry the (possibly edited) VN title; the rest of the
+  // body mirrors the single "Tạo video" create. Order-preserved results are each
+  // {jobId} or {error}.
+  batchCreateJobs: (body: BatchCreateBody): Promise<BatchCreateResponse> =>
+    fetch('/api/jobs/batch', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) }).then(jsonOrThrow),
+
+  // Release all of a page's 'held' jobs (saved source-list rows) into the queue so
+  // the runner starts processing them. Returns how many rows were flipped to
+  // 'queued'. Called after the main "Tạo video" create so saved sources flush in
+  // behind the freshly-created job.
+  releaseJobs: (pageId: number): Promise<{ released: number }> =>
+    fetch('/api/jobs/release', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ pageId }) }).then(jsonOrThrow),
+
   // Delete a finished video: removes the DB row + cleans up its files on disk.
-  // 404 if missing. See DeleteResult for the success shape.
-  deleteVideo: (id: number): Promise<DeleteResult> =>
-    fetch(`/api/videos/${id}`, { method: 'DELETE' }).then(jsonOrThrow),
+  // 404 if missing. See VideoDeleteResult for the success shape. When
+  // opts.keepScript is true, appends ?keepScript=true so the backend keeps the
+  // manifest (and clears only media + audio) — the script stays reusable.
+  deleteVideo: (id: number, opts?: { keepScript?: boolean }): Promise<VideoDeleteResult> =>
+    fetch(`/api/videos/${id}${opts?.keepScript ? '?keepScript=true' : ''}`, { method: 'DELETE' }).then(jsonOrThrow),
+
+  // DELETE /api/videos/{videoId}/posts?pageId={pageId} — remove a video from ONE
+  // page's "Sản phẩm" block ONLY: deletes that page's posts rows. Does NOT delete
+  // the video (it stays in the Video menu) and does NOT touch the real platform.
+  // Returns { ok, removed }. 404 (no posts on that page) throws ApiError.
+  removeVideoFromPage: (videoId: number, pageId: number): Promise<RemoveFromPageResult> =>
+    fetch(`/api/videos/${videoId}/posts?pageId=${pageId}`, { method: 'DELETE' }).then(jsonOrThrow),
+
+  // PATCH /api/videos/{id} — rename a video. Body { title } (null clears back to
+  // the source-derived title). Returns { ok, videoId, title }.
+  updateVideoTitle: (id: number, title: string | null): Promise<{ ok: boolean; videoId: number; title: string | null }> =>
+    fetch(`/api/videos/${id}`, {
+      method: 'PATCH',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ title }),
+    }).then(jsonOrThrow),
+
+  // POST /api/videos/{id}/cover — replace a produced video's cover/thumbnail with
+  // a cover from the page's generated-cover cache. Body { path } is the cover's
+  // disk path (from listCreatedCovers). Returns the new thumbUrl so the caller can
+  // refresh the card. 404 if the video/cover is missing.
+  setVideoCover: (id: number, path: string): Promise<{ ok: boolean; thumbUrl: string }> =>
+    fetch(`/api/videos/${id}/cover`, {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ path }),
+    }).then(jsonOrThrow),
+
+  // POST /generate/cover — kick off ASYNC cover generation for a title. Pass a new
+  // styleIndex (and seed=null) each call to vary the style. `summary` is a short
+  // content synopsis so the image is on-topic; `prompt` (when set) is a manual
+  // base prompt that overrides the auto title/summary prompt (style still varies
+  // per click). Returns { taskId } immediately; poll getCoverProgress(taskId)
+  // until status is 'done' (then read `result`) or 'error'.
+  // tiltDeg pins the auto-baked title's tilt (null = backend's seeded auto minority);
+  // the Studio form sends 0 by default so a fresh cover is flat unless the owner moves
+  // the "Độ nghiêng" slider manually.
+  generateCover: (body: { page: string; title: string; aspect: string; seed?: number | null; styleIndex?: number; summary?: string | null; prompt?: string | null; sourceLink?: string; tiltDeg?: number | null }): Promise<{ taskId: string }> =>
+    fetch('/generate/cover', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) }).then(jsonOrThrow),
+
+  // GET /generate/cover/progress/{taskId} — poll a cover generation task.
+  // `pct` is 0..100; `result` is the finished CoverResult only when status==='done';
+  // `error` is set only when status==='error'. `prompt` is the actual assembled
+  // prompt string sent to SDXL (manual verbatim, or auto title+summary+style);
+  // null when not yet available.
+  getCoverProgress: (taskId: string): Promise<{ status: 'running' | 'done' | 'error'; pct: number; msg: string; result: CoverResult | null; error: string | null; prompt: string | null }> =>
+    fetch(`/generate/cover/progress/${encodeURIComponent(taskId)}`).then(jsonOrThrow),
+
+  // POST /generate/cover/title — re-render the fancy Vietnamese title onto a clean
+  // cover. Always composites from `basePath` (the title-less image), so re-sending
+  // an edited `text` re-renders from the clean base (never stacks). The backend
+  // owns ALL styling (position, color, gradient, plates) — the FE only supplies the
+  // title text and the `keyWords` to highlight. SYNC: returns the finished
+  // CoverResult ({ path, url }) directly. `keyWords` comes from the generate result.
+  renderCoverTitle: (body: {
+    page: string
+    basePath: string
+    text: string
+    keyWords: string[]
+    // Optional changing integer — each click sends a NEW seed so the backend
+    // re-rolls a fresh style VARIATION (position/gradient/dominant-color shift).
+    seed?: number
+    // Optional manual overrides. Each knob left on "auto" (position) / null
+    // (keyColor/fontScale/tiltDeg) lets the backend do its seeded/auto thing;
+    // pinning a value overrides it.
+    //   position — "auto" (default) or one of the 9 anchors (top/center/bottom
+    //              × left/center/right).
+    //   keyColor — "#RRGGBB" plate color (gradient START); null = auto dominant color.
+    //   keyColor2 — "#RRGGBB" gradient END color; null = auto (or gradient off).
+    //   gradient — fill the plate with a gradient (default true).
+    //   strokeColor — "#RRGGBB" text BORDER (outline) color for every row; null = auto
+    //              contrast pick. When set the backend skips its contrast guard, so the
+    //              exact color is honored.
+    //   align — "auto" (centered + seeded jitter) | "left" | "center" | "right";
+    //              left/right flush every row to that edge of the title column.
+    //   fontScale — ~0.2–1.5 block-height fraction; null = auto.
+    //   tiltDeg  — title tilt in degrees (e.g. -20..20); null = auto seeded tilt.
+    position?: string
+    keyColor?: string | null
+    keyColor2?: string | null
+    gradient?: boolean
+    strokeColor?: string | null
+    align?: string
+    fontScale?: number | null
+    tiltDeg?: number | null
+  }): Promise<CoverResult> =>
+    fetch('/generate/cover/title', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) }).then(jsonOrThrow),
+
+  // GET /generate/cover/created?page=<page> — ALL generated covers in the page's
+  // cache dir (newest-first). Empty covers[] = none generated yet (valid).
+  listCreatedCovers: (page: string): Promise<{ covers: { path: string; url: string; filename: string; savedAt: string }[] }> =>
+    fetch(`/generate/cover/created?page=${encodeURIComponent(page)}`).then(jsonOrThrow),
+
+  // DELETE /generate/cover/created — remove ONE generated cover from the cache dir.
+  // Idempotent; the backend only deletes cache-level covers (refuses the saved/
+  // subdir and path traversal). Body carries the page + the cover's disk path.
+  deleteCreatedCover: (body: { page: string; path: string }): Promise<{ ok: boolean }> =>
+    fetch('/generate/cover/created', { method: 'DELETE', headers: JSON_HEADERS, body: JSON.stringify(body) }).then(jsonOrThrow),
 
   // Clear a video's saved script (set script = NULL). The video row and files
   // are kept; the video disappears from the reusable-scripts picker.
@@ -232,13 +499,41 @@ export const api = {
   // matching status.
   publishVideo: (
     id: number,
-    body: { accountIds: number[]; state?: 'PUBLISHED' | 'DRAFT' },
+    body: {
+      accountIds: number[]
+      state?: 'PUBLISHED' | 'SCHEDULED' | 'DRAFT'
+      // Unix seconds; required when state === 'SCHEDULED' (Facebook only).
+      scheduledPublishTime?: number
+      // Caption BODY verbatim (WITHOUT the "Nguồn:" credit line). null/omit → the
+      // backend uses its default. Applies to all targeted platforms.
+      description?: string | null
+      // Append the source credit server-side (default true). Set false to omit it.
+      includeSource?: boolean
+    },
   ): Promise<PublishResponse> =>
     fetch(`/api/videos/${id}/publish`, {
       method: 'POST',
       headers: JSON_HEADERS,
       body: JSON.stringify(body),
     }).then(jsonOrThrow),
+
+  // Per-platform publish preflight for the modal's platform columns: how each
+  // platform will treat THIS video (Facebook Reel vs post, YouTube Short vs
+  // video), from a path-only ffprobe on the server. 404 (no video) / 422 (file
+  // missing on disk) throw ApiError.
+  getPublishPreflight: (id: number): Promise<PublishPreflight> =>
+    fetch(`/api/videos/${id}/publish-preflight`).then(jsonOrThrow),
+
+  // Live upload progress for a video's in-flight publish to ONE platform (feed
+  // uploads take minutes). Progress is keyed per {videoId:platform}; currently
+  // only facebook is tracked. `active:false` = no entry / evicted (finished > ~30s
+  // ago). While active: phase (start|transfer|finish|done|error) + pct 0..100 +
+  // bytesSent/bytesTotal. Best-effort — poll while a column is publishing.
+  getPublishProgress: (
+    videoId: number,
+    platform: string,
+  ): Promise<{ active: boolean; phase?: string; pct?: number; bytesSent?: number; bytesTotal?: number }> =>
+    fetch(`/api/videos/${videoId}/publish-progress?platform=${encodeURIComponent(platform)}`).then(jsonOrThrow),
 
   // Clone a finished video at a DIFFERENT aspect ratio. The backend enqueues a
   // fast re-assemble of the SAME content (reuses cached script/audio/images — no
@@ -255,13 +550,36 @@ export const api = {
 
   // Per-platform video upload requirements (format/aspect/resolution/duration/
   // size/codecs) for the Publishing reference panel. Read-only reference data.
+  // GET /api/llm/models — script-gen LLM options (provider + model). The backend
+  // caches the list server-side (~6h), so the Studio just fetches it on mount; no
+  // client-side cache. See LlmModelsResponse for the shape.
+  getLlmModels: (): Promise<LlmModelsResponse> =>
+    fetch('/api/llm/models').then(jsonOrThrow),
+
   getPlatformSpecs: (): Promise<PlatformSpecsResponse> =>
     fetch('/api/platform-specs').then(jsonOrThrow),
 
-  // Per-page traffic analytics (platform split + monthly views) for the
-  // PageDetail charts. Empty arrays = no data yet (charts render empty states).
+  // Per-page traffic analytics (platform split + monthly views + follower counts)
+  // for the PageDetail charts. Empty arrays = no data yet (charts render empty
+  // states); followers/fanCount are null when the count is unavailable.
   getPageAnalytics: (pageId: number): Promise<PageAnalytics> =>
     fetch(`/api/pages/${pageId}/analytics`).then(jsonOrThrow),
+
+  // GET /api/system — live resource footprint + feature flags. The dashboard reads
+  // `apiUploadEnabled` to gate every publish (Đăng) affordance.
+  getSystem: (): Promise<SystemStats> =>
+    fetch('/api/system').then(jsonOrThrow),
+
+  // POST /api/videos/mark-posted — mark videos as MANUALLY posted (uploaded by hand)
+  // to the given platform on each video's OWN page. One result per video; on success
+  // the video's postedPlatforms gains the platform after a data refresh. Facebook is
+  // the only supported platform this round.
+  markPosted: (videoIds: number[], platform: 'facebook'): Promise<MarkPostedResponse> =>
+    fetch('/api/videos/mark-posted', {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify({ videoIds, platform }),
+    }).then(jsonOrThrow),
 
   // PART B: previously-produced videos whose script can be REUSED for this page
   // (skip script-gen). Pass `link` to narrow to scripts derived from the same
@@ -323,6 +641,14 @@ export const api = {
     fd.append('file', file)
     return fetch('/generate/image', { method: 'POST', body: fd }).then(jsonOrThrow)
   },
+
+  // POST /api/shutdown — kill the whole local stack (API, ComfyUI, vite, workers).
+  // The backend responds { ok: true } immediately, then detaches a killer process,
+  // so the server dies ~1.5s later. This fetch may reject with a network error if
+  // the process is torn down before the response is read — callers must treat a
+  // post-fire rejection as EXPECTED (the shutdown still happened).
+  shutdownProject: (): Promise<{ ok: boolean }> =>
+    fetch('/api/shutdown', { method: 'POST' }).then(jsonOrThrow),
 
   makeVideo: (body: {
     page: string

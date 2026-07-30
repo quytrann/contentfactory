@@ -2,3 +2,8 @@
 .venv/
 __pycache__/
 *.pyc
+_script_cache/
+_llm_cache/
+api.log
+api.log.*
+logs/

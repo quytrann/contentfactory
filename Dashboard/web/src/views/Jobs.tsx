@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react'
-import { Link2, Loader2, Play, SearchX, Square, Trash2, Type } from 'lucide-react'
+import { Check, Copy, Link2, Loader2, Pencil, Play, SearchX, Square, Trash2, Type, X } from 'lucide-react'
 import { useData, useDeleteEntity, useRefresh, useStopJob } from '../data'
 import { api } from '../api'
-import type { Job, JobStatus, PublishedPost } from '../types'
+import type { Job, JobStatus, PublishedPost, Video } from '../types'
 import { Card, ChipGroup, EmptyState, FilterBar, Modal, PLATFORM_META, SearchInput, SectionTitle, StatusBadge, fmtClock, fmtDate, useToast } from '../ui'
 import { SourceCreditButton } from '../components/SourceCreditModal'
 
@@ -64,7 +64,7 @@ function PublishedLinks({ posts }: { posts: PublishedPost[] }) {
   )
 }
 
-const STATUSES: JobStatus[] = ['queued', 'running', 'needs_input', 'done', 'failed', 'stopped']
+const STATUSES: JobStatus[] = ['held', 'queued', 'running', 'needs_input', 'done', 'failed', 'stopped']
 
 // Workflow run time for the queue column. Matches the WorkflowProgress elapsed
 // counter EXACTLY: (finishedAt − createdAt) once terminal, so the cell equals
@@ -90,7 +90,7 @@ export default function Jobs() {
     const produced = videos.find((v) => v.jobId === job.id)?.title?.trim()
     if (produced) return produced
     if (job.inputType === 'prompt' && job.inputPayload.trim()) return job.inputPayload
-    return `Video #${job.id}`
+    return `Video #${job.pageSeq ?? job.id}`
   }
   const [query, setQuery] = useState('')
   const [status, setStatus] = useState<'all' | JobStatus>('all')
@@ -118,7 +118,7 @@ export default function Jobs() {
     ...pages.map((p) => ({ value: String(p.id), label: p.name, count: JOBS.filter((j) => j.pageId === p.id).length })),
   ]
 
-  const STATUS_VI: Record<JobStatus, string> = { queued: 'chờ xử lý', running: 'đang chạy', needs_input: 'chờ nhập nguồn', done: 'xong', failed: 'lỗi', stopped: 'đã dừng' }
+  const STATUS_VI: Record<JobStatus, string> = { held: 'đã lưu', queued: 'chờ xử lý', running: 'đang chạy', needs_input: 'chờ nhập nguồn', done: 'xong', failed: 'lỗi', stopped: 'đã dừng' }
   const statusOptions = [
     { value: 'all', label: 'Tất cả', count: JOBS.length },
     ...STATUSES.map((s) => ({ value: s, label: STATUS_VI[s], count: JOBS.filter((j) => j.status === s).length })),
@@ -129,7 +129,7 @@ export default function Jobs() {
   return (
     <div className="space-y-6">
       <SectionTitle sub="Các yêu cầu sản xuất từ chat. Chạy theo hàng đợi vì mỗi video mất vài phút.">
-        Lịch sử Video
+        Lịch sử Job
       </SectionTitle>
 
       <FilterBar>
@@ -170,18 +170,33 @@ export default function Jobs() {
             </tr>
           </thead>
           <tbody className="divide-y divide-line">
-            {filtered.map((j, i) => (
+            {filtered.map((j) => (
               <tr key={j.id} className="hover:bg-panel2/60">
-                {/* Contiguous display index (1..N over the current sort), NOT j.id. */}
-                <td className="px-4 py-3 tabular-nums text-muted">{sortDir === 'asc' ? i + 1 : filtered.length - i}</td>
+                {/* Stable per-page job number (page_seq): matches creation/history order,
+                    same value everywhere, never shifts on filter/sort/delete. Falls back
+                    to the raw id only on legacy rows predating page_seq. */}
+                <td className="px-4 py-3 tabular-nums text-muted">{j.pageSeq ?? j.id}</td>
                 <td className="max-w-sm px-4 py-3">
                   <div className="flex items-center gap-2">
                     <InputIcon type={j.inputType} />
                     <span className="truncate">{j.inputPayload}</span>
+                    {j.inputType === 'link' && j.inputPayload.trim() && (
+                      <CopySourceButton url={j.inputPayload} />
+                    )}
                   </div>
                 </td>
                 <td className="max-w-xs px-4 py-3">
-                  <span className="block truncate" title={videoTitle(j)}>{videoTitle(j)}</span>
+                  {(() => {
+                    // Editable only when the job has actually produced a video row
+                    // (the title lives on videos.title). Otherwise show the derived
+                    // fallback text (topic / placeholder), no edit affordance.
+                    const produced = videos.find((v) => v.jobId === j.id)
+                    return produced ? (
+                      <EditVideoTitle video={produced} />
+                    ) : (
+                      <span className="block truncate" title={videoTitle(j)}>{videoTitle(j)}</span>
+                    )
+                  })()}
                 </td>
                 <td className="px-4 py-3">
                   <PublishedLinks posts={j.publishedPosts} />
@@ -213,20 +228,33 @@ export default function Jobs() {
 
       {/* Mobile cards */}
       <div className="space-y-3 md:hidden">
-        {filtered.map((j, i) => (
+        {filtered.map((j) => (
           <Card key={j.id} className="p-4">
             <div className="flex items-start justify-between gap-3">
               <div className="flex min-w-0 items-center gap-2">
                 <InputIcon type={j.inputType} />
                 <span className="truncate text-sm font-medium">{j.inputPayload}</span>
+                {j.inputType === 'link' && j.inputPayload.trim() && (
+                  <CopySourceButton url={j.inputPayload} />
+                )}
               </div>
               <StatusBadge status={j.status} />
             </div>
-            <div className="mt-1 truncate text-xs text-muted" title={videoTitle(j)}>
-              Tên video: <span className="text-fg">{videoTitle(j)}</span>
-            </div>
+            {(() => {
+              const produced = videos.find((v) => v.jobId === j.id)
+              return produced ? (
+                <div className="mt-1 flex items-center gap-1 text-xs text-muted">
+                  <span className="shrink-0">Tên video:</span>
+                  <EditVideoTitle video={produced} />
+                </div>
+              ) : (
+                <div className="mt-1 truncate text-xs text-muted" title={videoTitle(j)}>
+                  Tên video: <span className="text-fg">{videoTitle(j)}</span>
+                </div>
+              )
+            })()}
             <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted">
-              <span>#{sortDir === 'asc' ? i + 1 : filtered.length - i}</span>
+              <span>#{j.pageSeq ?? j.id}</span>
               <span className="tabular-nums">{j.aspect ?? '—'}</span>
               <span>{fmtDate(j.createdAt)}</span>
               <span className="tabular-nums">{runTime(j)}</span>
@@ -408,4 +436,122 @@ function DeleteJobButton({ job }: { job: Job }) {
 function InputIcon({ type }: { type: 'prompt' | 'link' }) {
   const Icon = type === 'link' ? Link2 : Type
   return <Icon className="h-4 w-4 shrink-0 text-brand" aria-label={type} />
+}
+
+// Inline edit of a PRODUCED video's title, right in the history list. Saving hits
+// PATCH /api/videos/{id}, which updates videos.title — the SINGLE source of truth
+// — then refreshes the shared dataset. Because every view (this list, the Video
+// library, page "Sản phẩm", Overview, the publish modal's default caption) derives
+// its title from that same store, the rename shows EVERYWHERE with no extra wiring.
+function EditVideoTitle({ video }: { video: Video }) {
+  const refresh = useRefresh()
+  const { success, error: toastError } = useToast()
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(video.title ?? '')
+  const [saving, setSaving] = useState(false)
+  const current = video.title ?? ''
+
+  const save = async () => {
+    const next = draft.trim()
+    if (!next || next === current) {
+      setEditing(false)
+      setDraft(current)
+      return
+    }
+    setSaving(true)
+    try {
+      await api.updateVideoTitle(video.id, next)
+      await refresh() // re-fetch the shared store → all views reflect the new title
+      setEditing(false)
+      success('Đã đổi tiêu đề')
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : 'Đổi tiêu đề thất bại')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (editing) {
+    return (
+      <div className="flex items-center gap-1">
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') { e.preventDefault(); void save() }
+            if (e.key === 'Escape') { setEditing(false); setDraft(current) }
+          }}
+          autoFocus
+          className="min-w-0 flex-1 rounded border border-line bg-panel px-1.5 py-1 text-xs leading-snug text-fg outline-none focus:border-brand/50 focus:ring-1 focus:ring-brand/30"
+          aria-label="Sửa tiêu đề video"
+        />
+        <button
+          type="button"
+          onClick={() => void save()}
+          disabled={saving}
+          title="Lưu"
+          aria-label="Lưu tiêu đề"
+          className="grid h-6 w-6 shrink-0 place-items-center rounded text-emerald-500 transition hover:bg-emerald-500/10 disabled:opacity-50"
+        >
+          {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+        </button>
+        <button
+          type="button"
+          onClick={() => { setEditing(false); setDraft(current) }}
+          disabled={saving}
+          title="Hủy"
+          aria-label="Hủy sửa tiêu đề"
+          className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted transition hover:bg-panel2 hover:text-fg disabled:opacity-50"
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex items-center gap-1">
+      <span className="min-w-0 flex-1 truncate text-fg" title={current || undefined}>
+        {current || <span className="italic text-muted">Chưa có tiêu đề</span>}
+      </span>
+      <button
+        type="button"
+        onClick={() => { setDraft(current); setEditing(true) }}
+        title="Đổi tên video"
+        aria-label="Đổi tên video"
+        className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted transition hover:bg-panel2 hover:text-fg"
+      >
+        <Pencil className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  )
+}
+
+// Copy the source link (a 'link' job's input URL) to the clipboard, with a brief
+// checkmark. Rendered only for 'link' jobs — a 'prompt' job's payload is topic
+// text, not a URL.
+function CopySourceButton({ url }: { url: string }) {
+  const { success, error: toastError } = useToast()
+  const [copied, setCopied] = useState(false)
+  const doCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(url)
+      setCopied(true)
+      success('Đã copy source link')
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      toastError('Không copy được link')
+    }
+  }
+  return (
+    <button
+      type="button"
+      onClick={doCopy}
+      title="Copy source link"
+      aria-label="Copy source link"
+      className="inline-flex shrink-0 items-center justify-center rounded-md border border-line bg-panel2 p-1 text-muted transition hover:border-brand/40 hover:text-fg"
+    >
+      {copied ? <Check className="h-3.5 w-3.5 text-emerald-500" /> : <Copy className="h-3.5 w-3.5" />}
+    </button>
+  )
 }

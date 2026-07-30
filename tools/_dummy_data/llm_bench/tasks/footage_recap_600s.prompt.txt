@@ -1,0 +1,70 @@
+You are a scriptwriter for a Vietnamese short-video channel that RE-EDITS foreign content. The source material (footage) is only ILLUSTRATION; your Vietnamese commentary is the main content. Below is the source transcript with timestamps (seconds).
+
+MODE: RECAP (valuable condensed retell). RETELL the source faithfully but CONDENSED: KEEP roughly 60-75% of the source — drop the least-important beats, redundancy, and slow stretches, but PRESERVE the substantive story. You MUST REORDER the logic for clarity (do NOT just follow the source order) and ADD a LIGHT layer of analysis: open with a strong hook and close with a takeaway/lesson. This is more than a trim — it is a curated, re-sequenced retell in your own narrating voice, never a verbatim copy. The original footage is illustration only; your narration leads and is the main content. Length is SOURCE-DERIVED (it follows from how much you keep). Write ALL narration in Vietnamese.
+
+SAFETY RULES (mandatory):
+1. Real transformation — analyze, reorder, add a take; do NOT translate verbatim.
+2. Your voice is the main content (>60-80%); the source footage is illustration only.
+3. The opening has a strong hook in the first 3-5 seconds.
+4. KEEP ENGLISH TERMS AS-IS: technical terms, proper nouns, product/library/technology names (e.g. MCP, RAG, LLM, agent, context window, token, prompt, API, framework, GitHub...) MUST stay in English in the narration — do NOT translate, transliterate, or Vietnamize them. Embed them naturally inside the Vietnamese sentence. The TTS pronunciation for these terms is handled separately. EXCEPTION — common non-technical terms that have a natural Vietnamese equivalent SHOULD be translated: use "tính năng" for "feature", "cơ sở dữ liệu" for "database", "triển khai" for "deploy". When in doubt, keep the English term.
+5. CUT THE NON-CONTENT SEGMENTS: completely drop ads, like/subscribe/follow prompts for the original channel, sponsor reads, channel self-promotion, bloated intros/outros, and silent/dead gaps that carry no information. Do NOT retell them and do NOT create scenes for them. Do NOT pick the ad/subscribe/sponsor/intro/outro time ranges as illustrative footage (sourceStart/sourceEnd).
+6. ONE SCENE = ONE COMFORTABLE BREATH (avoid rushed proper-noun lists): do NOT cram more than ~3 English proper nouns (product/tool/library/company names) into a single short scene, and do NOT put a long comma-separated enumeration of names in one scene. When you must list several names, SPLIT them across consecutive scenes (a few names per scene) and/or PAD with connective Vietnamese words (e.g. "cùng với", "và", "chẳng hạn như", "là những ví dụ") so each scene's spoken line stays at a calm, natural speaking density and is never crammed. Never rely on speeding up the voice.
+
+Source video title: Why Most Teams Fail At Self-Hosting Their AI Stack
+Source transcript (seconds, only within 0-600s):
+"""
+[0.0-8.4] Hey everyone, welcome back to the channel. Before we start, hit that subscribe button and ring the bell, it really helps us out.
+[8.4-19.0] Today's video is sponsored by our friends at a VPN company, use code SELFHOST for thirty percent off your first year.
+[19.0-31.5] Alright. So over the last eight months I have talked to something like forty engineering teams who tried to move their AI workloads off the big cloud APIs and onto hardware they own.
+[31.5-44.0] And here is the uncomfortable number: roughly three out of four of them gave up and went back to a paid API within a quarter.
+[44.0-58.2] That is not because the models are bad. Open weights caught up a long time ago for most everyday tasks. The failure is almost always operational.
+[58.2-72.0] The first mistake is the one everybody makes. They benchmark the model, they do not benchmark the pipeline.
+[72.0-86.5] Somebody downloads a seven billion parameter model, runs a couple of prompts in a notebook, sees a nice answer, and declares the migration solved.
+[86.5-101.0] But a notebook does not have a queue. It does not have a second job competing for the same GPU. It does not have a cold start.
+[101.0-116.0] On a single consumer card, and I am talking about the eight gigabyte class here, memory is the whole game. Weights, KV cache, and whatever else you already had resident.
+[116.0-130.5] I watched one team load an image model and a language model at the same time on one card and then spend two weeks debugging what they thought was a driver bug.
+[130.5-142.0] It was not a driver bug. It was contention. The card simply did not have the memory and the allocator was thrashing.
+[142.0-156.0] So rule one: on constrained hardware, models run sequentially, and you design the schedule for that from day one instead of discovering it in production.
+[156.0-171.5] The second mistake is quotas. People read the headline rate limit and completely ignore the token limit sitting underneath it.
+[171.5-186.0] I have seen a team pick a provider advertising thirty requests a minute, feel great about it, and then discover the daily token ceiling let them process about nine long documents before the day was over.
+[186.0-199.0] Requests per day is the number in the marketing table. Tokens per minute is the number that actually stops your pipeline at four in the afternoon.
+[199.0-214.0] Third, and this one is subtle: structured output support is a property of the endpoint, not of the model.
+[214.0-229.5] The same model name, served by two different providers behind a router, can give you strict schema enforcement on one and best-effort JSON on the other.
+[229.5-243.0] If your downstream code parses that JSON and hard-fails, you have just built a system whose reliability depends on which machine happened to pick up your request.
+[243.0-257.5] The fix is boring but it works: ask the router to only route to endpoints that support every parameter you sent, and validate the parsed object anyway.
+[257.5-268.0] Quick reminder to smash that like button if this is useful so far, and let me know in the comments what you are running locally.
+[268.0-283.0] Fourth mistake: treating a free tier as if it were a stable dependency. Free catalogues rotate. Aggressively.
+[283.0-297.5] I pulled a list of free model identifiers a year ago and checked it again last week. Almost nothing on the old list still resolves.
+[297.5-311.0] So if you hardcode a model identifier anywhere in your codebase, you have written a time bomb with a fuse measured in weeks.
+[311.0-325.5] Discover the catalogue at runtime, filter it by the capabilities you actually need, and pick from what is available right now.
+[325.5-340.0] Fifth: nobody measures quality in their own language. Everyone quotes an English leaderboard and assumes it transfers.
+[340.0-354.5] It does not transfer. A model that writes beautiful English can produce stilted, oddly formal output in a language with different register conventions.
+[354.5-369.0] And the failure mode there is nasty, because fluent output that quietly drifts from the source reads as correct until somebody who speaks the language properly checks it.
+[369.0-383.5] The only thing that actually worked for the teams that succeeded was an in-house A B test. One fixed task, several candidates, side by side, read by a native speaker.
+[383.5-397.0] It takes an afternoon and it settles arguments that no public benchmark can settle for you.
+[397.0-412.0] Sixth: latency planning. People assume local is faster because there is no network hop. On constrained hardware it usually is not.
+[412.0-426.5] If you have to load and unload weights around every other job on the box, you pay the load time on every single call, and that dwarfs the network round trip you saved.
+[426.5-441.0] Seventh, and honestly the one that kills the most projects: no fallback ladder. One provider, no plan B, and a hard dependency on it staying up.
+[441.0-455.5] The free endpoints I measured were running somewhere between ninety four and ninety nine point seven percent daily uptime.
+[455.5-470.0] Ninety four percent sounds fine until you translate it. That is roughly one failure in every sixteen or seventeen requests.
+[470.0-484.5] For a batch job that retries, who cares. For a user-facing request with no retry path, that is a support ticket several times a day.
+[484.5-499.0] So build the ladder. Primary, secondary, and a local floor that guarantees you are never fully stopped even if it only produces a draft.
+[499.0-513.5] Eighth: privacy. Read the terms. Most free tiers reserve the right to train on what you send them, and some reserve the right to publish it.
+[513.5-528.0] For public source material that is genuinely fine. For anything with a credential or personal data in the prompt, it absolutely is not.
+[528.0-542.5] Put an assertion in your code that refuses to send a prompt containing anything that looks like a token or a key. Do not rely on remembering.
+[542.5-557.0] Ninth: cost accounting that only counts money. Your time is the expensive input, and a flaky self-hosted stack eats a lot of it.
+[557.0-571.5] The teams that succeeded were the ones that treated the migration as an engineering project with a budget, not as a weekend experiment.
+[571.5-583.0] So to summarize: benchmark the pipeline, not the model. Watch tokens, not requests. Check the endpoint, not the model name.
+[583.0-592.0] Discover at runtime, test in your own language, and always have a ladder.
+[592.0-600.0] That is it for today. If you got something out of this, subscribe, and I will see you in the next one.
+"""
+
+HARD WORD CAP (ABSOLUTE MAXIMUM, NOT a target): the TOTAL Vietnamese narration across ALL scenes must be AT MOST 1161 words. This is a strict ceiling, not a goal — fewer is fine, more is FORBIDDEN. (This source span is 600s; staying under the cap keeps the finished video shorter than the source.)
+This is RECAP mode — condensed curated retell (60-75% of source): SELECT the most important beats; DROP redundancy, slow stretches, and minor asides. You MAY reorder for clarity and add a light layer of analysis, but preserve the substantive story. Keep the source's time range (0-600s).
+NO REPETITION (MANDATORY): EVERY scene must cover NEW source material — never repeat, restate, or re-summarize a beat you already narrated in an earlier scene. Re-narrating covered content burns the word cap WITHOUT increasing coverage, so the kept-ratio falls short of the target. Keep moving forward through the source.
+PER-SCENE BUDGET: aim for about 29 words per scene — keep each narration tight, 1-3 short Vietnamese sentences. The scene count is a SOFT TARGET (~40): use fewer or more as the content's natural structure requires, but the total word cap above always wins.
+REJECTION RULE: any script whose total narration EXCEEDS 1161 words will be REJECTED outright. For EACH scene:
+- 'narration': the spoken Vietnamese line, concise and natural (your commentary/recap). Write all 'narration' in VIETNAMESE (the channel's own voice) — do NOT output English narration. FULL TRANSLATION IS MANDATORY — every sentence must read clearly in Vietnamese with NO stray English: translate ALL English words, verbs, adjectives, technical terms, and common loanwords into natural Vietnamese; do NOT leave any English word untranslated. Keep in the original ONLY genuine PROPER NOUNS (personal / place / brand / product / company names) and standard units/symbols. When a technical term has a normal Vietnamese equivalent, use it; otherwise render its MEANING naturally in Vietnamese (you may append the English term once in parentheses only if it genuinely aids understanding).
+- 'sourceStart','sourceEnd': the time range (seconds) in the transcript above to TAKE illustrative footage for that scene — must lie within 0-600s, each clip ~3-8 seconds.
+Pick the worthwhile moments; you may reorder them for a better narrative flow.
+Return ONLY a single valid JSON array, no markdown. Each element: {"scene": <number from 1>, "narration": "<Vietnamese>", "sourceStart": <seconds>, "sourceEnd": <seconds>}.

@@ -1,0 +1,34 @@
+Traceback (most recent call last):
+  File "D:\workspace\ContentFactory\Dashboard\api\workers\download_worker.py", line 261, in <module>
+    main()
+  File "D:\workspace\ContentFactory\Dashboard\api\workers\download_worker.py", line 224, in main
+    info = ydl.extract_info(cfg["link"], download=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Installed\cf-venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1637, in wrapper
+    return func(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Installed\cf-venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3583, in process_video_result
+    self.process_info(new_info)
+  File "E:\Installed\cf-venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3457, in process_info
+    success, real_download = self.dl(temp_filename, info_dict)
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Installed\cf-venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 3170, in dl
+    return fd.download(name, new_info, subtitle)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Installed\cf-venv\Lib\site-packages\yt_dlp\downloader\common.py", line 464, in download
+    ret = self.real_download(filename, info_dict)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Installed\cf-venv\Lib\site-packages\yt_dlp\downloader\http.py", line 372, in real_download
+    return download()
+           ^^^^^^^^^^
+  File "E:\Installed\cf-venv\Lib\site-packages\yt_dlp\downloader\http.py", line 348, in download
+    self.report_error(f'\r[download] Got error: {e}')
+  File "E:\Installed\cf-venv\Lib\site-packages\yt_dlp\downloader\common.py", line 46, in <lambda>
+    error=IDENTITY if not fatal else lambda e: self.report_error(f'\r[download] Got error: {e}'),
+                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "E:\Installed\cf-venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1166, in report_error
+    self.trouble(f'{self._format_err("ERROR:", self.Styles.ERROR)} {message}', *args, **kwargs)
+  File "E:\Installed\cf-venv\Lib\site-packages\yt_dlp\YoutubeDL.py", line 1104, in trouble
+    raise DownloadError(message, exc_info)
+yt_dlp.utils.DownloadError: ERROR:
+[download] Got error: (<HTTPSConnection(host='rr2---sn-ojnpo5-c3.googlevideo.com', port=443) at 0x24a96ddc390>, 'Connection to rr2---sn-ojnpo5-c3.googlevideo.com timed out. (connect timeout=20.0)'). Giving up after 10 retries

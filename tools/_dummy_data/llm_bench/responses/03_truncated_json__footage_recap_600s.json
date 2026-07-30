@@ -1,0 +1,29 @@
+{
+  "id": "chatcmpl-fixture",
+  "object": "chat.completion",
+  "created": 1785000000,
+  "model": "glm-4.5-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Here is the script you asked for:\n\n[\n  {\n    \"scene\": 1,\n    \"narration\": \"Ba trong bốn nhóm kỹ thuật đã bỏ cuộc chỉ sau một quý.\",\n    \"sourceStart\": 19.0,\n    \"sourceEnd\": 26.0\n  },\n  {\n    \"scene\": 2,\n    \"narration\": \"Không phải vì mô hình"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 3900,
+    "completion_tokens": 16384,
+    "total_tokens": 20284
+  },
+  "_bench": {
+    "task": "footage_recap_600s",
+    "as_provider": "zai",
+    "expect_verdict": "FAIL",
+    "latency_sec": 41.2,
+    "structured": "fallback:none",
+    "note": "Output cut off mid-array (the classic max_tokens truncation) plus a chatty preamble -> must FAIL at parse, not crash."
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "_README": "Vietnamese correction memory for the TTS pipeline. Human-editable list of known problem terms that F5-TTS renders unreliably (rushed/slurred/split/dragged). Applied ONLY in the per-sentence F5 path (tts_worker.py). The pronunciation respellings live SEPARATELY in word_improve.md; this file adds per-term VERIFICATION + best-of-N reselect. NOTHING IS CACHED: every occurrence of every term is synthesized FRESH, so a repeated term (e.g. 'agent') varies naturally per occurrence and per run. Voice-independent — no per-voice data is stored or read, so it covers any clone voice with no warm-up. Gate: env CF_VI_CORRECTIONS (default on). Re-roll budget: env CF_VI_BEST_OF_N. Path override: env CF_VI_CORRECTIONS_PATH. No API restart needed — the worker reads this fresh every run.",
+  "_schema": {
+    "term": "whole-word, case-insensitive phrase matched on the SPOKEN sentence text (BEFORE pron-map respelling, i.e. the original narration token, e.g. 'agent', 'cho phép').",
+    "expected": "INLINE terms: list of whisper tokens (accent-insensitive prefix match) a CORRECT render transcribes to; a good draw must contain a contiguous run matching >= CF_VI_MATCH_MIN of these (VN phrases transcribe reliably on the small verify model). ISOLATABLE terms: the say_as syllables (e.g. 'ây jừn') — used only for the syllable COUNT; the isolated segment is verified by gap/duration on its OWN wav, NOT by matching an English token, because the small verify whisper romanizes a loanword respelling unreliably ('ây-jừn' -> 'Ây chừng').",
+    "isolatable": "METADATA that selects the VERIFICATION method (no caching, ever). true = the term renders as its OWN F5 chunk (its word_improve.md say_as carries a hyphen/tilde speed marker, so _split_by_speed gives it a standalone FAST/SLOW segment); it is verified on that isolated segment by gap/duration. An isolatable term whose say_as has NO speed marker is auto-demoted to inline. false = 'inline' plain-text phrase inside the whole-clause chunk; verified on the whole clip by whisper token match + pace/gap. Both kinds re-roll the WHOLE clip on failure and keep a FRESH best draw — nothing is spliced or frozen.",
+    "note": "free-text human note; ignored by code."
+  },
+  "corrections": [
+    {
+      "term": "agent",
+      "expected": ["ây", "jừn"],
+      "isolatable": true,
+      "note": "say_as 'ây-jừn' (1-hyphen FAST) -> own chunk (2 syllables). Verified on its own segment by gap/duration; a bad draw splits it into 'ây | jừn' (abnormal mid-word gap) or clips/drags it."
+    },
+    {
+      "term": "agents",
+      "expected": ["ây", "jừn"],
+      "isolatable": true,
+      "note": "same say_as 'ây-jừn' as 'agent'. Verified on its own segment by gap/duration; always freshly synthesized (no cache)."
+    },
+    {
+      "term": "cho phép",
+      "expected": ["cho", "phép"],
+      "isolatable": false,
+      "note": "inline VN phrase. Bad draw rushes/merges 'cho phép' -> single 'chép' (fails the 2-token check)."
+    }
+  ]
+}

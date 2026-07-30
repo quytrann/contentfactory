@@ -1,0 +1,33 @@
+{
+  "name": "scene_list_topic",
+  "strict": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["scenes"],
+    "properties": {
+      "scenes": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scene", "narration", "image_prompt"],
+          "properties": {
+            "scene": {
+              "type": "integer",
+              "description": "1-based scene number, contiguous"
+            },
+            "narration": {
+              "type": "string",
+              "description": "the spoken line, in Vietnamese"
+            },
+            "image_prompt": {
+              "type": "string",
+              "description": "9:16 vertical frame description, in English, for SDXL"
+            }
+          }
+        }
+      }
+    }
+  }
+}

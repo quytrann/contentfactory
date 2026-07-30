@@ -119,7 +119,7 @@ def test_auto_floor_min_5():
 def test_fixed_floor_min_3():
     """FIXED never returns < 3 at a tiny duration (the word-budget cap can pull it
     below 5, but the max(3, …) floor holds)."""
-    # at duration 1: budget = round(1*2.1)=2; max_scenes_for_budget = max(3, 2//8)=3.
+    # at duration 1: budget = round(1*2.5)=2; max_scenes_for_budget = max(3, 2//8)=3.
     assert g._auto_scene_count(1, auto=False, edit_mode="commentary") == 3
     assert g._auto_scene_count(1, auto=False, edit_mode="commentary") >= 3
     assert g._auto_scene_count(0, auto=False, edit_mode="commentary") >= 3
@@ -133,10 +133,11 @@ def test_topic_only_default_scene_count_math():
         expected = max(5, g._word_budget(dur) // g._MIN_WORDS_PER_SCENE)
         # the same arithmetic the route uses inline.
         assert expected == max(5, g._word_budget(dur) // g._MIN_WORDS_PER_SCENE)
-    # spot-check concrete values to pin the constants.
-    assert g._word_budget(60) == 126           # round(60 * 2.1)
-    assert max(5, g._word_budget(60) // g._MIN_WORDS_PER_SCENE) == 15   # 126 // 8
-    assert max(5, g._word_budget(300) // g._MIN_WORDS_PER_SCENE) == 78  # 630 // 8
+    # spot-check concrete values to pin the constants (budget pace 2.5 — owner's safe
+    # choice in the 2026-06-27 tuning pass; measured was 3.25, prior guess was 2.1).
+    assert g._word_budget(60) == 150           # round(60 * 2.5)
+    assert max(5, g._word_budget(60) // g._MIN_WORDS_PER_SCENE) == 18   # 150 // 8
+    assert max(5, g._word_budget(300) // g._MIN_WORDS_PER_SCENE) == 93  # 750 // 8
     # tiny duration → floor of 5 binds.
     assert max(5, g._word_budget(1) // g._MIN_WORDS_PER_SCENE) == 5
 
@@ -152,8 +153,8 @@ def test_topic_default_matches_generate_script_request_default():
     resolved = sceneCount or max(5, g._word_budget(durationSec) // g._MIN_WORDS_PER_SCENE)
     old_value = max(5, round(durationSec / 7))
     assert resolved == max(5, g._word_budget(90) // g._MIN_WORDS_PER_SCENE)
-    # 90s: budget=189, 189//8=23; old source/7 = round(90/7)=13. They differ.
-    assert resolved == 23
+    # 90s: budget=round(90*2.5)=225, 225//8=28; old source/7 = round(90/7)=13. They differ.
+    assert resolved == 28
     assert resolved != old_value
 
 

@@ -4,12 +4,25 @@ Dashboard/secrets/
 *.token.json
 *.credentials.json
 .env
+.env.bak*
 
 # Generated media (large, regenerable)
 GameStory/assets/*
 GameStory/output/*
 GameStory/scripts/*.json
 !**/.gitkeep
+
+# Logs — runtime output, never commit (kept on disk locally)
+*.log
+*.log.*
+logs/
+
+# Bench artifacts (tools/llm_bench.py). By default these are written OUTSIDE the repo
+# (E:\ContentFactory\_bench\llm\<run>), per the finished-output convention. This rule is
+# the safety net for an explicit `--out-dir` that points inside the repo: raw model
+# output is bulky, regenerable, and must never be committed.
+_bench_out/
+tools/_bench_out/
 
 # Scratch / session artifacts
 _workspace_prev/

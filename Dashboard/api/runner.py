@@ -20,6 +20,7 @@ import glob
 import math
 import os
 import shutil
+import frames_util
 import sys
 import threading
 import time
@@ -78,7 +79,11 @@ def _was_stopped(job_id: int) -> bool:
 # Shared publish core — the SAME path the manual POST /api/videos/{id}/publish
 # endpoint uses. Leaf module (imports only db + uploaders), so no import cycle
 # with main.py (which imports this runner module).
-from publish_core import publish_video_core
+from publish_core import API_UPLOAD_ENABLED, publish_video_core
+# Provider gate for TEXT script-gen. Imported for `resolve()` only — the runner never
+# calls an LLM itself, it just needs the concrete provider/model ids to record on the
+# video row. Leaf module (no import cycle: llm_gate imports generate lazily).
+import llm_gate
 from generate import (
     CONTENT_OUTPUT_ROOT,
     INGEST_MAX_SEC,
@@ -95,11 +100,14 @@ from generate import (
     SourceVideoRequest,
     TimedSegment,
     TransformFootageRequest,
+    sdxl_dims_for_aspect,
     TransformRequest,
     TtsRequest,
     TtsScene,
     _cut_clip,
     _detect_filler_ranges,
+    _fb_tag_clean,
+    _generate_fb_tags,
     _probe_duration,
     _run_ffmpeg,
     _scene_encode_workers,
@@ -110,13 +118,19 @@ from generate import (
     assemble,
     assemble_dubbed,
     assemble_footage,
+    assemble_translate_full,
+    bake_cover_first_frame,
+    TranslateFullAssembleRequest,
     download_source_video,
     generate_images,
     generate_ingest,
     generate_script,
     generate_script_footage,
     generate_script_transform,
+    generate_script_visual_explain,
     generate_tts,
+    append_outro,
+    CF_OUTRO_CARD_SEC,
     kill_job_processes,
     make_thumbnail,
     render_stickman_clip,
@@ -126,12 +140,27 @@ from generate import (
     set_model_busy,
     set_progress_cb,
 )
+from worker_errors import friendly_job_error
 
 POLL_SECONDS = float(os.getenv("RUNNER_POLL_SECONDS", "3"))
 DEFAULT_DURATION = int(os.getenv("RUNNER_TARGET_SECONDS", "60"))
 
 # Output frame size per chosen aspect ratio (width, height).
 ASPECTS = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080), "4:5": (1080, 1350)}
+
+# translate_full: caption band (fractional y-range of the SOURCE frame) the
+# caption-cover detector scans for the source's own burned-in captions. Default
+# bottom band [0.72, 0.90] worked on the de-risk test short. Exposed as an env
+# knob so it can be tuned per install; "no captions found -> 0 intervals" is valid.
+def _translate_full_caption_band() -> tuple[float, float]:
+    raw = os.getenv("TRANSLATE_FULL_CAPTION_BAND", "0.72,0.90")
+    try:
+        a, b = (float(x) for x in raw.split(","))
+        if 0.0 <= a < b <= 1.0:
+            return (a, b)
+    except (ValueError, TypeError):
+        pass
+    return (0.72, 0.90)
 
 # How many independent per-scene FFmpeg cuts to run concurrently in the footage
 # CUT step. Each _cut_clip reads the SAME read-only source and writes a DISTINCT
@@ -226,18 +255,29 @@ def _claim_job() -> dict | None:
             RETURNING id, page_id, input_type, input_payload, voice, edit_mode, comment,
                       source_video_id, aspect, target_sec, add_credit, publish,
                       render_mode, render_model, voice_clone_model, src_audio_volume,
+                      llm_provider, llm_model,
                       clone_of_video_id,
-                      reuse_script_video_id, bypass_tts_cache, title, publish_platform
+                      reuse_script_video_id, bypass_tts_cache, bypass_script_cache, title, publish_platform,
+                      cover_image_path, facebook_tags
             """
         ).fetchone()
 
 
 def _load_page(page_id: int) -> dict | None:
     with get_conn() as conn:
+        # `credit` carries the page's OWN branding handle (e.g. "@giaithichmoithu") shown on
+        # the final black outro card. It is one of the owner-owned identity fields (see the
+        # pages table comment): NULL means the owner has not supplied one, and we then render
+        # NO outro card rather than inventing a handle.
         return conn.execute(
-            "SELECT id, name, creator_name FROM pages WHERE id = %s",
+            "SELECT id, name, creator_name, credit FROM pages WHERE id = %s",
             (page_id,),
         ).fetchone()
+
+
+def _page_outro_handle(page: dict | None) -> str | None:
+    """The page's own outro-card handle (pages.credit), or None when unset."""
+    return ((page or {}).get("credit") or "").strip() or None
 
 
 def _resolve_publish_account_id(page_id: int, platform: str) -> int | None:
@@ -283,42 +323,172 @@ def _video_for_job(job_id: int) -> dict | None:
         ).fetchone()
 
 
-def _create_video(job_id: int, page_id: int) -> int:
+def _create_video(job_id: int, page_id: int, facebook_tags: str | None = None) -> int:
     with get_conn() as conn:
         return conn.execute(
-            "INSERT INTO videos (job_id, page_id, status) VALUES (%s, %s, 'rendering') RETURNING id",
-            (job_id, page_id),
+            "INSERT INTO videos (job_id, page_id, status, facebook_tags) "
+            "VALUES (%s, %s, 'rendering', %s) RETURNING id",
+            (job_id, page_id, facebook_tags),
         ).fetchone()["id"]
 
 
-def _load_reusable_script(src_video_id: int) -> tuple[list | None, str | None, str | None, str | None]:
+def _load_reusable_script(src_video_id: int) -> tuple[list | None, str | None, str | None, str | None, str | None]:
     """Load a source video's saved script for the PART-B script-reuse path.
 
-    Returns (scenes, title, source_name, source_link). `scenes` is the stored
-    videos.script JSONB (a list of scene dicts) or None when the row is missing or
-    its script is NULL/empty. The title/source_* are surfaced so the reusing job can
+    Returns (scenes, title, source_name, source_link, facebook_tags). `scenes` is the
+    stored videos.script JSONB (a list of scene dicts) or None when the row is missing
+    or its script is NULL/empty. The title/source_* are surfaced so the reusing job can
     carry the SAME credit/title hint as the source (the runner still lets a
-    user-supplied job title override it, exactly like the fresh path)."""
+    user-supplied job title override it, exactly like the fresh path). facebook_tags is
+    surfaced so the caller can copy it onto the new video row and skip the redundant
+    `claude -p` hashtag call in _auto_fill_fb_tags (the reused narration is identical,
+    so regenerating tags from it is wasted subscription usage)."""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT script, title, source_name, source_link FROM videos WHERE id = %s",
+            "SELECT script, title, source_name, source_link, facebook_tags FROM videos WHERE id = %s",
             (src_video_id,),
         ).fetchone()
-    if not row:
-        return None, None, None, None
-    scenes = row["script"]
+    scenes = row["script"] if row else None
     # psycopg3 returns JSONB as a parsed Python object (list); guard non-list/empty.
-    if not isinstance(scenes, list) or not scenes:
-        return None, row["title"], row["source_name"], row["source_link"]
-    return scenes, row["title"], row["source_name"], row["source_link"]
+    if isinstance(scenes, list) and scenes:
+        return (scenes, row["title"], row["source_name"], row["source_link"],
+                row["facebook_tags"])
+
+    # MANIFEST FALLBACK — an orphaned-manifest script (the DB video row was deleted
+    # with keepScript=true, or the script is otherwise NULL/empty). Rebuild the scene
+    # list from _cache/renders/<id>/manifest.json so a script-only reuse still works.
+    # Manifest scenes carry {scene, narration, caption, durationS} — the same shape
+    # the reuse->TTS path reads (footage cut timecodes are absent here, so this is
+    # for image/stickman reuse, which is exactly the "script-only" intent). The
+    # manifest never carries facebook_tags, so this path leaves it None — the caller's
+    # normal auto-generate step still fires, which is correct (no stored tags exist).
+    manifest = render_cache.load_manifest(src_video_id)
+    if manifest and isinstance(manifest.get("scenes"), list) and manifest["scenes"]:
+        m_scenes = [
+            {
+                "scene": s.get("scene"),
+                "narration": s.get("narration"),
+                "caption": s.get("caption") if s.get("caption") is not None else s.get("narration"),
+            }
+            for s in manifest["scenes"]
+            if isinstance(s, dict)
+        ]
+        print(f"[runner] _load_reusable_script: video {src_video_id} has no DB script "
+              f"— rebuilt {len(m_scenes)} scenes from render-cache manifest")
+        return (m_scenes, manifest.get("title"),
+                manifest.get("sourceName"), manifest.get("sourceLink"), None)
+
+    if not row:
+        return None, None, None, None, None
+    return None, row["title"], row["source_name"], row["source_link"], row["facebook_tags"]
 
 
-def _save_script(video_id: int, title: str | None, scenes: list, source_name: str | None, source_link: str | None) -> None:
+def _save_script(video_id: int, title: str | None, scenes: list, source_name: str | None,
+                 source_link: str | None,
+                 llm_used: tuple[str, str | None] | None = None) -> None:
+    """Persist the finished script onto the video row.
+
+    `llm_used` = (provider, model) that ACTUALLY produced this script, or None when NO
+    LLM ran (script reuse / retry reuse / dubbed resume). None leaves
+    videos.llm_provider_used / llm_model_used UNTOUCHED on purpose: recording a provider
+    for a run that made no call would be a lie, and on a resume it would also clobber the
+    truthful value the original run wrote."""
     with get_conn() as conn:
-        conn.execute(
-            "UPDATE videos SET title = %s, script = %s, source_name = %s, source_link = %s WHERE id = %s",
-            (title, Json(scenes), source_name, source_link, video_id),
-        )
+        if llm_used is None:
+            conn.execute(
+                "UPDATE videos SET title = %s, script = %s, source_name = %s, source_link = %s WHERE id = %s",
+                (title, Json(scenes), source_name, source_link, video_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE videos SET title = %s, script = %s, source_name = %s, "
+                "source_link = %s, llm_provider_used = %s, llm_model_used = %s "
+                "WHERE id = %s",
+                (title, Json(scenes), source_name, source_link,
+                 llm_used[0], llm_used[1], video_id),
+            )
+
+
+# ---- Automatic Facebook hashtags (post-script) -------------------------------
+
+def _narration_from_script(script) -> str:
+    """Concatenate the Vietnamese narration text out of a saved script into one
+    plain-text blob, used as the CONTENT signal for content-aware FB-tag generation.
+
+    Handles BOTH stored shapes gracefully:
+      - scene ARRAY (image/footage/stickman/translate_full/clone):
+        [{ "scene": n, "narration": "...", ... }, ...] -> join the 'narration' text.
+      - dubbed / translate_full DICT: { "mode": ..., "subs": [{ "text_vi": "..." }] }
+        -> join the 'text_vi' subtitle text.
+    Returns "" for anything it cannot read; the caller then falls back to a
+    title-only prompt (still valid, just less content-specific)."""
+    parts: list[str] = []
+    if isinstance(script, list):
+        for s in script:
+            if isinstance(s, dict):
+                txt = s.get("narration") or s.get("text") or s.get("caption") or ""
+            else:
+                txt = s if isinstance(s, str) else ""
+            if isinstance(txt, str) and txt.strip():
+                parts.append(txt.strip())
+    elif isinstance(script, dict):
+        subs = script.get("subs")
+        if isinstance(subs, list):
+            for sub in subs:
+                if isinstance(sub, dict):
+                    txt = sub.get("text_vi") or sub.get("text") or sub.get("vi") or ""
+                else:
+                    txt = sub if isinstance(sub, str) else ""
+                if isinstance(txt, str) and txt.strip():
+                    parts.append(txt.strip())
+    return " ".join(parts).strip()
+
+
+def _auto_fill_fb_tags(video_id: int, title: str | None, edit_mode: str | None,
+                       page: str | None, script,
+                       llm_provider: str | None = None,
+                       llm_model: str | None = None) -> None:
+    """After the script is finalized, auto-generate CONTENT-AWARE Facebook hashtags
+    (from the real Vietnamese narration, not just the title) and store them on
+    videos.facebook_tags — but ONLY when that column is still NULL/empty, so an
+    owner-provided value copied from jobs.facebook_tags at create time is preserved.
+
+    Non-fatal by contract: ANY failure (DB error, Claude timeout, empty output) is
+    logged and swallowed so a tag problem can NEVER wedge or fail the pipeline. This
+    is a single quick `claude -p` call, run right after the (already-completed)
+    script step; _generate_fb_tags itself also never raises (title-derived fallback).
+    """
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT facebook_tags FROM videos WHERE id = %s", (video_id,)
+            ).fetchone()
+        existing = (row or {}).get("facebook_tags") if row else None
+        if existing and str(existing).strip():
+            # Owner supplied tags at create time (jobs.facebook_tags -> videos) — keep them.
+            return
+        content = _narration_from_script(script)
+        # _generate_fb_tags already normalizes/dedupes, forces the page brand tag, and
+        # hard-caps at 8 (brand-protected) — so the returned list is copy-ready.
+        tags = _generate_fb_tags(title=title or "", edit_mode=edit_mode,
+                                 page=page, content=content,
+                                 llm_provider=llm_provider, llm_model=llm_model)
+        if not tags:
+            print(f"[runner] auto FB-tags: no usable tags for video {video_id} (skipped)")
+            return
+        # Store the copy-ready NEWLINE-joined block (one hashtag per line): Facebook
+        # treats a space-joined block as a single tag, so the Videos-list copy button
+        # must copy a newline-separated block.
+        text = "\n".join(tags)
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE videos SET facebook_tags = %s WHERE id = %s",
+                (text, video_id),
+            )
+        print(f"[runner] auto FB-tags for video {video_id}: {len(tags)} tags "
+              f"(content-aware={'yes' if content else 'no'})")
+    except Exception as e:  # noqa: BLE001 — tags must NEVER fail a job
+        print(f"[runner] auto FB-tags SKIPPED for video {video_id} (non-fatal): {e}")
 
 
 # ---- needs_input (Dubbed credit gate) ----------------------------------------
@@ -404,6 +574,14 @@ def _save_assets(video_id: int, scenes: list, visuals: dict, audio: dict, visual
                     "INSERT INTO assets (video_id, kind, scene_index, path) VALUES (%s,'audio',%s,%s)",
                     (video_id, n, audio[n]["audioPath"]),
                 )
+
+
+# NOTE: _thumb_from_cover_or_frame was removed (2026-07-22). Render/finalize no
+# longer creates a sibling <video>.thumb.jpg; videos.thumb_path stays NULL and the
+# chosen cover is baked into the mp4's first frame by the FFmpeg assembly step. The
+# make_thumbnail import below is kept intentionally: tests monkeypatch
+# runner.make_thumbnail, and generate.make_thumbnail still backs the manual cover
+# feature (POST /api/videos/{id}/cover).
 
 
 def _finalize_video(video_id: int, audio_path: str | None, video_path: str, duration_s: float,
@@ -558,12 +736,25 @@ def _job_done(job_id: int) -> None:
 
 
 def _job_failed(job_id: int, video_id: int | None, msg: str) -> None:
+    """Finalize a job as 'failed'.
+
+    LAST-RESORT SANITIZER: whatever reaches here is what the dashboard renders, so
+    machine output (tracebacks, worker dumps) is translated into a friendly
+    Vietnamese sentence by worker_errors.friendly_job_error. Messages already
+    written for a human pass through untouched. The RAW text is printed first, so
+    logs/api.log keeps the full record for debugging — nothing is swallowed.
+    Most worker failures are already classified upstream in
+    generate._run_cf_worker_once; this catches everything else (ffmpeg, DB, ...).
+    """
     _CANCEL_REQUESTED.discard(job_id)
     _STOPPED_JOBS.discard(job_id)
+    friendly = friendly_job_error(msg)
+    if friendly != (msg or "").strip():
+        print(f"[runner] job {job_id} raw error (sanitized for UI): {msg}", flush=True)
     with get_conn() as conn:
         conn.execute(
             "UPDATE jobs SET status = 'failed', error = %s, finished_at = now() WHERE id = %s",
-            (msg[:2000], job_id),
+            (friendly[:2000], job_id),
         )
         if video_id:
             conn.execute("UPDATE videos SET status = 'failed' WHERE id = %s", (video_id,))
@@ -785,6 +976,61 @@ def _cleanup_job_intermediates(job_id: int, page_name: str, video_path: str | No
           f"kept final video + cache")
 
 
+def _resolve_manual_cover(job: dict) -> str | None:
+    """MAIN production path (image/footage): decide the cover to bake as the FIRST FRAME.
+
+    MANUAL ONLY — the cover the owner explicitly generated in the Studio and ticked
+    ("Sử dụng ảnh Cover"), which the FE sends as NewJobBody.coverImagePath and which is
+    already persisted on the job row. No cover attached -> None (the video stays coverless
+    and the FE just renders the mp4's first frame).
+
+    AUTO-COVER REMOVED (2026-07-28, owner decision): creating a video used to auto-generate
+    a vision cover here whenever the job had no manual cover but did have a source link
+    (yt-dlp thumbnail -> Claude vision prompt -> SDXL -> baked VN title). That whole flow is
+    gone — clicking "Tạo video" never renders a cover on its own any more. The MANUAL
+    feature is untouched: POST /generate/cover (the "Tạo Cover" button) and POST
+    /api/videos/{id}/cover (change the cover after render) both still work.
+
+    Consistent with the convention: the chosen cover is BAKED into the mp4 (no sibling
+    .thumb.jpg, videos.thumb_path stays NULL)."""
+    return (job.get("cover_image_path") or "").strip() or None
+
+
+def _resolve_clone_cover(job: dict, job_id: int) -> str | None:
+    """CLONE path: reuse the SOURCE video's cover — NO heavy vision render (owner decision).
+
+    - Manual cover set on the clone job -> use it (respect manual).
+    - Else look up the SOURCE video's cover: the clone references clone_of_video_id; the
+      video that produced it is videos.job_id, and that job carries the persisted
+      cover_image_path. Reuse that exact file (bake_cover_first_frame fits/pads it to the
+      clone's dims — accepted as-is).
+    - Source has no cover (or file missing) -> None (clone stays coverless, as before).
+
+    Cheap (a DB lookup), so it always runs. NEVER raises."""
+    manual = (job.get("cover_image_path") or "").strip()
+    if manual:
+        return manual
+    src_video_id = job.get("clone_of_video_id")
+    if not src_video_id:
+        return None
+    try:
+        with get_conn() as conn:
+            row = conn.execute(
+                "SELECT j.cover_image_path AS cover FROM videos v "
+                "JOIN jobs j ON j.id = v.job_id WHERE v.id = %s",
+                (src_video_id,),
+            ).fetchone()
+        cover = (str(row["cover"]).strip() if (row and row.get("cover")) else "")
+        if cover and os.path.isfile(cover):
+            _set_progress(job_id, "render", 92, "Dùng lại cover nguồn")
+            print(f"[runner] clone job {job_id} reusing source video {src_video_id} cover -> {cover}")
+            return cover
+        print(f"[runner] clone job {job_id} source video {src_video_id} has no reusable cover -> coverless")
+    except Exception as exc:  # noqa: BLE001 — never fail the clone on a cover lookup
+        print(f"[runner] clone job {job_id} source-cover lookup failed (ignored): {exc}")
+    return None
+
+
 def _process_clone_job(job: dict) -> None:
     """ASSEMBLE-ONLY path for a CLONE job (re-render an existing finished video at a
     DIFFERENT aspect ratio). Reuses the cached content snapshot from
@@ -808,6 +1054,8 @@ def _process_clone_job(job: dict) -> None:
         _job_failed(job_id, video_id, f"page {job['page_id']} not found")
         return
     page_name = page["name"]
+    # Page's OWN branding handle for the final black outro card (None -> no card).
+    outro_handle = _page_outro_handle(page)
 
     try:
         _set_progress(job_id, "render", 80, "Tải nội dung đã lưu")
@@ -884,8 +1132,11 @@ def _process_clone_job(job: dict) -> None:
                                                    bgmPath=bgm_path,
                                                    bgmVolume=(bgm_volume if bgm_volume is not None else 0.12),
                                                    sourceName=source_name, sourceLink=source_link,
-                                                   sourceLogo=source_logo, sourceHandle=source_handle,
-                                                   addCredit=add_credit),
+                                                   sourceLogo=source_logo, sourceHandle=source_handle, outroHandle=outro_handle,
+                                                   addCredit=add_credit,
+                                                   # Best-effort engine tag so an OmniVoice clone also skips
+                                                   # auto target-pace (cached audio is already as-drawn).
+                                                   engine=(job.get("voice_clone_model") or "").strip().lower() or None),
                             src_audio_volume,
                         )
                     )
@@ -908,7 +1159,7 @@ def _process_clone_job(job: dict) -> None:
                                         bgmPath=bgm_path,
                                         bgmVolume=(bgm_volume if bgm_volume is not None else 0.18),
                                         sourceName=source_name, sourceLink=source_link,
-                                        sourceLogo=source_logo, sourceHandle=source_handle,
+                                        sourceLogo=source_logo, sourceHandle=source_handle, outroHandle=outro_handle,
                                         addCredit=add_credit)
                     )
                 visual_kind = "image"
@@ -917,10 +1168,20 @@ def _process_clone_job(job: dict) -> None:
             set_model_busy(False)
 
         # Finalize the NEW video via the SHARED finalize path.
+        # No sibling .thumb.jpg is created and thumb_path stays NULL: the chosen cover
+        # (if any) is baked into the mp4 as its first frame by the FFmpeg assembly step.
+        # The FE renders the <video> first frame when thumbUrl is null; POST
+        # /api/videos/{id}/cover still sets a display-only poster after render.
         first_audio = m_scenes[0]["audioPath"] if m_scenes else None
-        thumb = make_thumbnail(res["videoPath"])
+        # Resolve the cover for a CLONE: manual if attached, else REUSE the SOURCE video's
+        # cover (NO heavy vision render — owner decision), else coverless. Then bake it into
+        # the mp4 as its FIRST FRAME (no-op when there's no cover). Must run BEFORE finalize
+        # so videos.video_path points at the baked file. In-place, no full re-encode.
+        cover_to_bake = _resolve_clone_cover(job, job_id)
+        bake_cover_first_frame(res["videoPath"], cover_to_bake,
+                               res.get("width") or width, res.get("height") or height)
         _finalize_video(video_id, first_audio, res["videoPath"], res["durationS"],
-                        res.get("width"), res.get("height"), thumb)
+                        res.get("width"), res.get("height"), None)
 
         # Snapshot the CLONE's OWN content so a clone can itself be re-cloned. The
         # cached visuals/audio are the SAME files reused from the source render cache;
@@ -941,7 +1202,11 @@ def _process_clone_job(job: dict) -> None:
             print(f"[runner] clone job {job_id} render-cache snapshot error (ignored): {snap_exc}")
 
         # Publish — OPT-IN, via the SHARED publish core (same as a normal job).
-        if job.get("publish"):
+        if job.get("publish") and not API_UPLOAD_ENABLED:
+            # API upload kill-switch is ON: skip auto-publish, never fail the job.
+            _set_progress(job_id, "publish", 95, "Hoàn tất (đăng qua API đang tạm tắt)")
+            print(f"[runner] clone job {job_id} auto-publish SKIPPED (API_UPLOAD_ENABLED is off)")
+        elif job.get("publish"):
             _set_progress(job_id, "publish", 95, "Đăng / hoàn tất")
             try:
                 # Per-platform target: when publish_platform is set, publish ONLY to
@@ -1153,6 +1418,64 @@ def _enforce_duration_guard(job_id, res: dict, src_dur) -> None:
         )
 
 
+# Zero-tolerance epsilon for the post-TTS early duration gate. The owner's rule is
+# STRICT: if the output would exceed the source by ANY amount (even a fraction of a
+# millisecond) the job must fail. So the threshold is exactly 0 — `total >= src_dur`
+# fails, with no slack. We catch it HERE, the EARLIEST point the REAL (measured, not
+# estimated) output seconds are known — right after TTS, before whisper + per-scene
+# encoding + concat — so an over-length job fails fast instead of burning the whole
+# assembly stage only to die at the post-assembly _enforce_duration_guard (the final
+# backstop, which still stays in place).
+_EARLY_DURATION_EPSILON_SEC = 0.0
+
+
+def _enforce_post_tts_duration(job_id, audio: dict, scenes: list, src_dur,
+                               add_credit: bool, has_slate_content: bool,
+                               outro_handle: str | None = None) -> None:
+    """EARLY zero-tolerance duration gate (owner-requested). Sums the ACTUAL per-scene
+    VO seconds (already probed by the TTS step → `audio[scene]["durationS"]`) plus the
+    fixed credit-slate seconds that assemble_footage will append, and FAILS the job
+    immediately if that total >= the source duration (strict, epsilon == 0).
+
+    This is the SAME invariant the post-assembly _enforce_duration_guard enforces, but
+    moved to the earliest point the real output length is known (right after TTS, before
+    whisper/encode/concat). The caller MUST gate this exactly like the post-assembly
+    guard (only for source-tracking modes) so we never false-fail an original-length
+    mode. Never speeds up or truncates audio — the only honest recovery is to fail and
+    ask for a shorter script.
+
+    Self-skips when `src_dur` is falsy/<=0 (no source to compare against) — mirroring the
+    post-assembly guard's skip-and-log behavior. The slate is added only when it will
+    actually be appended (add_credit AND there is logo/handle/source_name to show),
+    matching _make_assemble_progress's slate_w condition so the estimate is faithful.
+    """
+    if not src_dur or src_dur <= 0:
+        print(f"[runner] job {job_id} early duration gate SKIPPED: source duration unknown")
+        return
+    total_vo = 0.0
+    for s in scenes:
+        r = audio.get(s["scene"]) or {}
+        try:
+            d = float(r.get("durationS")) if r.get("durationS") is not None else 0.0
+        except (TypeError, ValueError):
+            d = 0.0
+        total_vo += max(0.0, d)
+    slate = _BUDGET_SLATE_SEC if (add_credit and has_slate_content) else 0.0
+    # The black outro handle card is appended too (independent of add_credit), so it must be
+    # in this sum or the gate would under-estimate the output and let a video exceed the source.
+    outro_card = CF_OUTRO_CARD_SEC if outro_handle else 0.0
+    total = total_vo + slate + outro_card
+    # Zero tolerance: any overshoot (total >= src_dur, no epsilon) fails immediately.
+    if total >= src_dur - _EARLY_DURATION_EPSILON_SEC:
+        print(f"[runner] job {job_id} EARLY duration gate FAILED (post-TTS, before "
+              f"whisper/assembly): VO={total_vo:.3f}s + slate={slate:.1f}s "
+              f"+ outro={outro_card:.1f}s = {total:.3f}s >= source={src_dur:.3f}s")
+        raise RuntimeError(
+            f"Video đầu ra ({total:.1f}s) sẽ dài hơn hoặc bằng video gốc "
+            f"({src_dur:.1f}s) — dừng ngay, hãy giảm nội dung kịch bản."
+        )
+
+
 def _process_job(job: dict) -> None:
     job_id = job["id"]
     # Publish this as the active job so every subprocess a pipeline step spawns
@@ -1165,6 +1488,8 @@ def _process_job(job: dict) -> None:
         set_active_job(None)
         return
     page_name = page["name"]
+    # Page's OWN branding handle for the final black outro card (None -> no card).
+    outro_handle = _page_outro_handle(page)
     # jobs.render_mode is now the AUTHORITATIVE source for the render mode (the
     # Studio writes it at job creation; pages.architecture_type/config were dropped
     # in the 2026-06-25 schema redesign). Prefer it when present.
@@ -1213,6 +1538,34 @@ def _process_job(job: dict) -> None:
     # — those raise 422 on an unknown editMode against EDIT_MODE_GUIDE, and "dubbed" is
     # deliberately not in that dict (it produces no narration scene array).
     is_dubbed = (edit_mode or "").lower() == "dubbed"
+    # translate_full — FULL re-upload: keep the ENTIRE source video, MUTE its audio,
+    # narrate a VN F5-TTS translation of a full faithful translation, burn VN subtitles,
+    # and COVER the source's own burned-in karaoke. Closest to dubbed mechanics but it
+    # DOES run TTS (+ a caption-cover pre-pass) and mutes the original audio. Like
+    # is_dubbed, it is detected HERE (before any prompt builder) so it is intercepted and
+    # never reaches generate_script_footage/_transform (those 422 on an unknown editMode
+    # against EDIT_MODE_GUIDE, and "translate_full" is deliberately not in that dict —
+    # it produces per-line translated subs, not a narration scene array).
+    is_translate_full = (edit_mode or "").lower() == "translate_full"
+    # PER-JOB LLM CHOICE for TEXT script-gen (the provider gate, generate/llm_gate.py).
+    # Read exactly like voice_clone_model above: normalized, empty -> None, and None means
+    # "claude-cli with its default model" — i.e. the ONLY behavior that existed before the
+    # gate. Threaded into every generate_script_* / dubbed-translate / filler / FB-tag call
+    # below. The two VISION calls deliberately ignore it (they need Claude Code's Read-tool
+    # agentic behavior, which no chat-completions provider has).
+    llm_provider = (job.get("llm_provider") or "").strip().lower() or None
+    llm_model = (job.get("llm_model") or "").strip() or None
+    # The concrete (provider, model) this job's script-gen will use. Correct as an
+    # "actually served" record today BECAUSE llm_gate never falls back across providers:
+    # whatever resolves here is what ran, or the job failed. (If a fallback ladder is ever
+    # added, this must switch to reading the served provider back out of the
+    # generate_script_* response, which already returns llmProvider/llmModel.)
+    _job_llm = llm_gate.resolve(llm_provider, llm_model)
+    # Set to _job_llm ONLY on a branch that really made an LLM call; stays None on every
+    # reuse/resume branch so _save_script does not claim a provider that never ran.
+    _llm_used: tuple[str, str | None] | None = None
+    if llm_provider:
+        print(f"[runner] job {job_id} LLM provider override: {_job_llm[0]}/{_job_llm[1]}")
     # RETRY SCRIPT REUSE (A3). On a retry the SAME job_id may already have a prior
     # video row whose videos.script was saved by a run that got through script-gen
     # before failing later (TTS/cut/assemble). Detect that BEFORE creating the fresh
@@ -1222,12 +1575,12 @@ def _process_job(job: dict) -> None:
     _retry_scenes = None
     _prior_video = _video_for_job(job_id)
     if _prior_video:
-        _ps, _pt, _psn, _psl = _load_reusable_script(_prior_video["id"])
+        _ps, _pt, _psn, _psl, _pfbt = _load_reusable_script(_prior_video["id"])
         if _ps:
             _retry_scenes = _ps
             print(f"[runner] job {job_id} retry: reusing script from prior video "
                   f"{_prior_video['id']} ({len(_retry_scenes)} scenes)")
-    video_id = _create_video(job_id, page["id"])
+    video_id = _create_video(job_id, page["id"], job.get("facebook_tags"))
 
     # Dubbed requires a SOURCE link (it dubs an existing video). A dubbed job with no
     # link has nothing to dub — fail fast and clearly rather than NameError later.
@@ -1236,6 +1589,13 @@ def _process_job(job: dict) -> None:
                     "Chế độ Dubbed cần một video nguồn (link) để lồng phụ đề — "
                     "job này không có link nguồn.")
         print(f"[runner] job {job_id} DUBBED FAILED: no source link to dub")
+        return
+    # translate_full also requires a SOURCE link (it re-uploads an existing video).
+    if is_translate_full and job["input_type"] != "link":
+        _job_failed(job_id, video_id,
+                    "Chế độ Dịch nguyên video (translate_full) cần một video nguồn "
+                    "(link) — job này không có link nguồn.")
+        print(f"[runner] job {job_id} TRANSLATE_FULL FAILED: no source link")
         return
 
     # PART B — SCRIPT REUSE. When the job carries reuse_script_video_id, the runner
@@ -1248,6 +1608,7 @@ def _process_job(job: dict) -> None:
     # on those paths needs the source transcript once the script is reused.
     reuse_src_id = job.get("reuse_script_video_id")
     reuse_scenes = reuse_title = reuse_source_name = reuse_source_link = None
+    reuse_facebook_tags = None
     # DUBBED RESUME: a Dubbed job resumed from the needs_input pause carries
     # reuse_script_video_id pointing at its OWN parked video, whose videos.script is a
     # {mode:'dubbed', subs, filler} DICT (not a scene list). _load_reusable_script
@@ -1257,8 +1618,15 @@ def _process_job(job: dict) -> None:
     # `claude -p`). The credit fields entered (or the deliberate skip) live on the
     # video row + jobs.needs_input and are read back below.
     reuse_dubbed = _load_dubbed_record(reuse_src_id) if (reuse_src_id and is_dubbed) else None
-    if reuse_src_id and not reuse_dubbed:
-        reuse_scenes, reuse_title, reuse_source_name, reuse_source_link = _load_reusable_script(reuse_src_id)
+    # translate_full saves a {mode:'translate_full', subs, filler} DICT (not a scene
+    # list), which _load_reusable_script rejects. A translate_full RESUME (from the
+    # credit-gate pause) therefore ignores reuse_src_id here and re-ingests +
+    # re-translates on the fresh path below (an extra claude -p, but correct — a full
+    # 1:1 translation is deterministic enough to reproduce). Guard with
+    # `not is_translate_full` so we never mis-route its dict through the scene-reuse path.
+    if reuse_src_id and not reuse_dubbed and not is_translate_full:
+        (reuse_scenes, reuse_title, reuse_source_name, reuse_source_link,
+         reuse_facebook_tags) = _load_reusable_script(reuse_src_id)
         if not reuse_scenes:
             _job_failed(job_id, video_id, "Video nguồn không có kịch bản để dùng lại")
             print(f"[runner] job {job_id} reuse FAILED: source video {reuse_src_id} "
@@ -1266,6 +1634,20 @@ def _process_job(job: dict) -> None:
             return
         print(f"[runner] job {job_id} REUSING script from video {reuse_src_id} — "
               f"script-gen BYPASSED (no claude -p), {len(reuse_scenes)} scenes")
+        # Reused narration is IDENTICAL to the source video's, so its hashtags are
+        # still valid — copy them onto the new video row now (before _auto_fill_fb_tags
+        # runs) so its NULL-check skips the redundant `claude -p` hashtag call. Owner-
+        # supplied job.facebook_tags (already applied by _create_video above) always
+        # wins and is never overwritten here.
+        if reuse_facebook_tags and str(reuse_facebook_tags).strip() and not job.get("facebook_tags"):
+            with get_conn() as conn:
+                conn.execute(
+                    "UPDATE videos SET facebook_tags = %s WHERE id = %s AND "
+                    "(facebook_tags IS NULL OR facebook_tags = '')",
+                    (reuse_facebook_tags, video_id),
+                )
+            print(f"[runner] job {job_id} reused facebook_tags from video {reuse_src_id} "
+                  f"— auto FB-tags call skipped")
     elif reuse_dubbed:
         print(f"[runner] job {job_id} DUBBED RESUME from video {reuse_src_id} — "
               f"translate/filler BYPASSED (no claude -p), "
@@ -1288,7 +1670,7 @@ def _process_job(job: dict) -> None:
         src_video = None
         # Footage AND dubbed both need the cached 720p source mp4 (footage cuts scene
         # clips from it; dubbed cuts+concats keep-ranges from it). Gate both modes here.
-        if (render_mode == "footage" or is_dubbed) and job["input_type"] == "link":
+        if (render_mode == "footage" or is_dubbed or is_translate_full) and job["input_type"] == "link":
             _set_progress(job_id, "ingest", 5, "Tải video nguồn")
             set_progress_cb(lambda pct, msg: _set_progress(job_id, "ingest", 5 + round(pct / 100 * 8), msg))
             try:
@@ -1312,7 +1694,7 @@ def _process_job(job: dict) -> None:
         # translate/filler `claude -p` calls); the source mp4 was already re-fetched
         # by the download_source_video block above (gated on is_dubbed).
         _do_ingest = _is_link_job and not reuse_dubbed and (
-            not reuse_scenes or render_mode == "footage" or is_dubbed)
+            not reuse_scenes or render_mode == "footage" or is_dubbed or is_translate_full)
         if _do_ingest:
             _set_progress(job_id, "ingest", 13 if src_video else 5, "Bóc lời nguồn")
             # Forward the worker's live download/transcribe progress (0-100) into
@@ -1355,6 +1737,18 @@ def _process_job(job: dict) -> None:
                 win = _max_seg_end
             else:
                 win = _file_dur or _max_seg_end
+            # translate_full BUG-1 fix: the source's trailing outro/credit is usually a
+            # VISUAL block AFTER the spoken content ends (little/no transcript). If the
+            # script window is the FILE duration, the footage tiling extends the final
+            # scene over that outro and the reup shows the ORIGINAL channel's credit at
+            # the end. Cap the window to the last spoken segment's end so no scene window
+            # can reach the post-speech outro. (Spoken outro junk is separately excluded
+            # by the footage prompt's CUT-junk rule.)
+            if is_translate_full and _max_seg_end > 0:
+                if win > _max_seg_end:
+                    print(f"[runner] job {job_id} TRANSLATE_FULL: capping window "
+                          f"{win:.1f}s -> content end {_max_seg_end:.1f}s (exclude source outro)")
+                win = min(win, _max_seg_end)
             # In AUTO mode the output length follows the SOURCE. Use the ingested
             # source duration (durationS, from the probe/whisper step) to drive the
             # script length; if it's somehow missing, fall back to the transcript
@@ -1376,20 +1770,99 @@ def _process_job(job: dict) -> None:
             else:
                 gen_duration = target
                 print(f"[runner] job {job_id} FIXED mode: condense to {gen_duration}s")
+            # NO-SPEECH visual-explain fallback. When ingest returns ZERO whisper
+            # transcript segments (a source that has audio but no speech — e.g. an
+            # animation with only music/SFX), there is nothing to rewrite or translate.
+            # Instead we sample frames, show them to Claude (vision), and generate a
+            # Vietnamese explainer that TILES the whole source, then run the NORMAL
+            # footage assembly (Ken Burns + karaoke captions + bgm + F5/VieNeu TTS).
+            # This MUST precede the is_dubbed / is_translate_full / render_mode=="footage"
+            # branches below — all of them consume ing["segments"] and would 422 (footage:
+            # "Provide source 'segments'") or produce empty output. Skipped when the job
+            # already carries a reusable/retry script (that saved script wins over a fresh,
+            # expensive vision pass).
+            _no_speech = not ing.get("segments")
+            _will_reuse_script = bool(reuse_scenes) or bool(_retry_scenes and not reuse_src_id)
+            if _no_speech and not _will_reuse_script:
+                # Both the frame sampling and the downstream footage cut need the source
+                # mp4. It is normally downloaded up-front (footage/dubbed/translate_full
+                # link jobs); re-fetch defensively if a different render_mode skipped that.
+                if src_video is None:
+                    _set_progress(job_id, "footage", 20, "Tải video nguồn")
+                    src_video = download_source_video(
+                        SourceVideoRequest(link=payload, page=page_name, window=window or None))
+                _set_progress(job_id, "script", 26, "Xem hình ảnh video nguồn")
+                # Per-job frames dir under the shared media cache; removed after gen.
+                frames_dir = os.path.join(CONTENT_OUTPUT_ROOT, "_cache", "frames", f"job{job_id}")
+                frames = frames_util.sample_frames(src_video["videoPath"], frames_dir)
+                # Metadata: prefer what ingest emitted; OLD cached transcripts (incl. job
+                # 232's) lack the description/tags keys, so fall back to a yt-dlp metadata
+                # fetch (best-effort, never raises, never fabricated).
+                _ve_desc = ing.get("description")
+                _ve_tags = ing.get("tags")
+                if not _ve_desc:
+                    _ve_meta = frames_util.fetch_source_metadata(payload)
+                    _ve_desc = _ve_meta.get("description") or ""
+                    if not _ve_tags:
+                        _ve_tags = _ve_meta.get("tags") or []
+                # FORCE the footage assembly path for the rest of this job (TTS narration +
+                # real-clip cut + karaoke), regardless of the original render_mode/edit_mode
+                # or the dubbed/translate_full flags. Clearing is_dubbed/is_translate_full
+                # ensures neither the no-TTS dubbed path nor the translate_full caption-cover
+                # path is taken. edit_mode -> "commentary": visual-explain is explanatory /
+                # original-length, so the source-tracking duration guards (_mode_tracks_source)
+                # correctly self-skip instead of false-failing.
+                render_mode = "footage"
+                is_dubbed = False
+                is_translate_full = False
+                edit_mode = "commentary"
+                try:
+                    with _timed(job_id, "script"):
+                        scenes = _run_with_time_ramp(
+                            job_id, "script", "Viết kịch bản (từ hình ảnh)", 26, 40,
+                            SCRIPT_RAMP_EXPECTED_SEC,
+                            lambda: generate_script_visual_explain(
+                                frames,
+                                title=title or "",
+                                description=_ve_desc or "",
+                                tags=_ve_tags or [],
+                                sourceDurationSec=src_dur,
+                                targetDurationSec=gen_duration,
+                                jobId=job_id,
+                            )["scenes"],
+                        )
+                    # VISION path: this script came from Claude Code headless with the
+                    # Read tool, NOT from the job's chosen text provider — that choice is
+                    # deliberately not honored here (see llm_gate's docstring). Record
+                    # what truly ran: the claude-cli default pair.
+                    _llm_used = llm_gate.resolve(None, None)
+                finally:
+                    # Frames are only needed for the vision call; drop them whether it
+                    # succeeded or failed (a 422 thin-script failure still cleans up).
+                    shutil.rmtree(frames_dir, ignore_errors=True)
+                # source_name/source_link were set from ingest above and flow into the
+                # footage credit slate; owner-owned credit fields stay TODO_ASK_USER.
+                print(f"[runner] job {job_id} NO-SPEECH source → visual-explain fallback "
+                      f"({len(scenes)} scenes from {len(frames)} frames)")
             # DUBBED (Section F): no narration script. Translate the source segments
             # into faithful VN subtitles and detect filler ranges (both claude -p),
             # then assemble below from the cached source mp4 — NO TTS / SDXL / stickman.
             # We set `scenes = []` (dubbed has no narration scene array); the TTS/
             # script-gen steps are wrapped in `if not is_dubbed:` and the dubbed
             # assemble branch runs in the visuals section.
-            if is_dubbed:
+            elif is_dubbed:
                 _set_progress(job_id, "script", 30, "Dịch phụ đề tiếng Việt")
                 dubbed_subs = _run_with_time_ramp(
                     job_id, "script", "Dịch phụ đề tiếng Việt", 30, 38, SCRIPT_RAMP_EXPECTED_SEC,
-                    lambda: _translate_subs_to_vi(ing["segments"])
+                    lambda: _translate_subs_to_vi(ing["segments"],
+                                                  llm_provider=llm_provider,
+                                                  llm_model=llm_model)
                 )
                 _set_progress(job_id, "script", 38, "Phát hiện đoạn cần cắt")
-                dubbed_filler = _detect_filler_ranges(ing["segments"], src_dur=src_dur)
+                dubbed_filler = _detect_filler_ranges(ing["segments"], src_dur=src_dur,
+                                                      llm_provider=llm_provider,
+                                                      llm_model=llm_model)
+                _llm_used = _job_llm
                 # Persist a minimal, mode-specific record (subs + filler) as the script
                 # so the row is inspectable; this does NOT feed reuse for other modes.
                 scenes = []
@@ -1429,7 +1902,7 @@ def _process_job(job: dict) -> None:
                         _dub_title = (job.get("title") or "").strip() or title or f"job_{job_id}"
                         _save_script(video_id, _dub_title,
                                      {"mode": "dubbed", "subs": dubbed_subs, "filler": dubbed_filler},
-                                     source_name, source_link)
+                                     source_name, source_link, llm_used=_llm_used)
                         _missing = [name for present, name in (
                             (source_name, "sourceName"),
                             (source_handle, "handle"),
@@ -1463,6 +1936,66 @@ def _process_job(job: dict) -> None:
                     _record_credit_decision(job_id, "disabled")
                     print(f"[runner] job {job_id} DUBBED: crediting disabled by owner; "
                           f"recorded creditDecision='disabled' (no pause)")
+            # translate_full (full localization). Owner-chosen approach A: ride the FOOTAGE
+            # prompt path (natural narration + sourceStart/End, junk removed) — NOT a 1:1
+            # literal translation. Scene-gen is identical to footage; the translate_full
+            # TREATMENT (mute source, EasyOCR caption-cover on the CUT video, karaoke over
+            # the cover band, Ken Burns zoom) is applied in assemble_translate_full below.
+            # The dubbed-style credit gate still applies (a full reupload must credit source).
+            elif is_translate_full:
+                with _timed(job_id, "script"):
+                    scenes = _run_with_time_ramp(
+                        job_id, "script", "Viết kịch bản (dịch nguyên video)", 25, 40,
+                        SCRIPT_RAMP_EXPECTED_SEC,
+                        lambda: generate_script_footage(
+                            TransformFootageRequest(
+                                segments=[TimedSegment(start=sg["start"], end=sg["end"], text=sg["text"])
+                                          for sg in ing["segments"]],
+                                editMode=edit_mode, title=title, durationSec=gen_duration, windowSec=win,
+                                auto=auto,
+                                skipScriptCache=bool(job.get("bypass_script_cache")),
+                                llmProvider=llm_provider, llmModel=llm_model,
+                            )
+                        )["scenes"]
+                    )
+                _llm_used = _job_llm
+                print(f"[runner] job {job_id} TRANSLATE_FULL: {len(scenes)} footage scenes "
+                      f"(full-localization prompt; junk excluded)")
+
+                # ---- CREDIT GATE (same policy as dubbed; a full reupload MUST credit its
+                #      source). Pause for owner input when the slate would be silently
+                #      skipped (none of logo/handle/source_name present).
+                if add_credit:
+                    _has_slate_credit = bool(source_logo or source_handle or source_name)
+                    if not _has_slate_credit:
+                        _tf_title = (job.get("title") or "").strip() or title or f"job_{job_id}"
+                        _save_script(video_id, _tf_title, scenes, source_name, source_link,
+                                     llm_used=_llm_used)
+                        _missing = [name for present, name in (
+                            (source_name, "sourceName"),
+                            (source_handle, "handle"),
+                            (source_logo, "logo"),
+                            (source_link, "sourceLink"),
+                        ) if not present]
+                        _job_needs_input(job_id, video_id, {
+                            "kind": "credit",
+                            "missingFields": _missing,
+                            "prefill": {
+                                "sourceName": source_name,
+                                "sourceLink": source_link,
+                                "handle": source_handle,
+                                "logo": source_logo,
+                            },
+                            "creditDecision": None,
+                            "videoId": video_id,
+                        }, pct=28)
+                        print(f"[runner] job {job_id} TRANSLATE_FULL PAUSED (needs_input): "
+                              f"no source credit after ingest; missing={_missing}")
+                        return
+                else:
+                    _record_credit_decision(job_id, "disabled")
+                    print(f"[runner] job {job_id} TRANSLATE_FULL: crediting disabled by "
+                          f"owner; recorded creditDecision='disabled' (no pause)")
             # SCRIPT REUSE (footage): ingest ran (cut needs the source + cut
             # timecodes), but script generation is BYPASSED — use the loaded scenes
             # straight from the source video. No `claude -p` on this path.
@@ -1495,9 +2028,12 @@ def _process_job(job: dict) -> None:
                                           for sg in ing["segments"]],
                                 editMode=edit_mode, title=title, durationSec=gen_duration, windowSec=win,
                                 auto=auto,
+                                skipScriptCache=bool(job.get("bypass_script_cache")),
+                                llmProvider=llm_provider, llmModel=llm_model,
                             )
                         )["scenes"]
                     )
+                _llm_used = _job_llm
             else:
                 with _timed(job_id, "script"):
                     scenes = _run_with_time_ramp(
@@ -1506,9 +2042,11 @@ def _process_job(job: dict) -> None:
                             TransformRequest(
                                 transcript=ing["transcript"], editMode=edit_mode, title=title,
                                 durationSec=gen_duration, sourceLang=ing.get("language"), auto=auto,
+                                llmProvider=llm_provider, llmModel=llm_model,
                             )
                         )["scenes"]
                     )
+                _llm_used = _job_llm
         elif reuse_dubbed:
             # DUBBED RESUME (from the needs_input credit pause): ingest was SKIPPED
             # (subs + filler are cached). Re-hydrate them and the credit fields the
@@ -1569,8 +2107,11 @@ def _process_job(job: dict) -> None:
                 # Black-box script gen — same time-based estimate ramp over [25,40].
                 scenes = _run_with_time_ramp(
                     job_id, "script", "Viết kịch bản", 25, 40, SCRIPT_RAMP_EXPECTED_SEC,
-                    lambda: generate_script(ScriptRequest(topic=payload, durationSec=target))["scenes"]
+                    lambda: generate_script(ScriptRequest(
+                        topic=payload, durationSec=target,
+                        llmProvider=llm_provider, llmModel=llm_model))["scenes"]
                 )
+                _llm_used = _job_llm
             title = payload[:80]
 
         # Dubbed legitimately has NO narration scenes (scenes == []); every other
@@ -1589,12 +2130,46 @@ def _process_job(job: dict) -> None:
             # subs + filler) under videos.script so the row is inspectable, and set an
             # empty audio map so the shared tail (which reads `audio`) is satisfied.
             # Steps 1b/2/2b (budget/TTS/cap) are skipped entirely.
+            # _llm_used is None on a DUBBED RESUME (subs/filler came from the cached
+            # record, no claude -p ran) — that leaves the original run's recorded
+            # provider intact instead of re-asserting it.
             _save_script(video_id, job_title,
                          {"mode": "dubbed", "subs": dubbed_subs, "filler": dubbed_filler},
-                         source_name, source_link)
+                         source_name, source_link, llm_used=_llm_used)
             audio = {}
         else:
-            _save_script(video_id, job_title, scenes, source_name, source_link)
+            # FIXED OUTRO CTA — appended to the LAST scene's narration before the script is
+            # persisted, so TTS speaks it, the karaoke shows it, and a script REUSE of this
+            # video already carries it (append_outro is idempotent, so a reuse/retry cannot
+            # stack it twice). Its seconds were already reserved out of the word budget (see
+            # generate._auto_word_ceiling), so the duration gates below stay honest.
+            #
+            # translate_full is EXCLUDED: it is a strict 1:1 per-source-line translation whose
+            # scenes are pinned to source timecodes, so appending narration to the last line
+            # would desync it from the footage it must sit over. (Dubbed can't reach here — it
+            # takes the branch above and runs no TTS at all.)
+            if not is_translate_full and append_outro(scenes):
+                print(f"[runner] job {job_id} appended fixed outro CTA to scene "
+                      f"{scenes[-1].get('scene')}")
+            # translate_full also lands here: it now rides the footage prompt, so its
+            # script is a normal scene ARRAY (viewable in the /script preview like footage).
+            # _llm_used is None on every reuse branch (explicit script reuse, retry
+            # reuse) — no LLM produced these scenes, so nothing is recorded.
+            _save_script(video_id, job_title, scenes, source_name, source_link,
+                         llm_used=_llm_used)
+
+        # AUTO FB-TAGS. Now that the script is finalized and saved on the video row,
+        # generate content-aware Facebook hashtags from the real Vietnamese narration
+        # and store them on videos.facebook_tags — ONLY if the owner did not already
+        # supply tags at create time (jobs.facebook_tags -> videos, copied in
+        # _create_video). Non-fatal: _auto_fill_fb_tags swallows every error, so a tag
+        # failure/slowness can never wedge or fail the pipeline. Runs after the script
+        # step, before render — a single quick `claude -p`.
+        _auto_fill_fb_tags(
+            video_id, job_title, edit_mode, page_name,
+            {"mode": "dubbed", "subs": dubbed_subs} if is_dubbed else scenes,
+            llm_provider=llm_provider, llm_model=llm_model,
+        )
 
         # Steps 1b (time-budget), 2 (TTS), 2b (VO cap) are NARRATION-only. Dubbed has
         # no narration scenes and no TTS, so skip them entirely; `audio` is already
@@ -1619,8 +2194,8 @@ def _process_job(job: dict) -> None:
             # voice band [55,70] so the chip percent moves in real time.
             voice, ref = _resolve_voice(page_name, job["voice"])
             # The Studio "Model lồng tiếng" (voice_clone_model) picks the TTS engine.
-            # f5-tts → F5 path; vieneu/unset/legacy → VieNeu. When a clone is used and
-            # no explicit engine is set, generate_tts derives it from the clone's name.
+            # F5-TTS is the project default: vieneu → VieNeu; everything else (unset/f5-tts)
+            # → F5. When no explicit engine is set, generate_tts derives it from the clone's name.
             vcm = (job.get("voice_clone_model") or "").strip().lower() or None
 
             # TTS is wrapped in a closure so the FOOTAGE path can run it CONCURRENTLY
@@ -1650,11 +2225,12 @@ def _process_job(job: dict) -> None:
                     set_progress_cb(None)
                 return {r["scene"]: r for r in tts["results"]}
 
-            if render_mode == "footage":
+            if render_mode == "footage" or is_translate_full:
                 # Defer: the footage branch below starts TTS in a thread and runs the
                 # cuts concurrently, then joins both before assemble. `audio` is filled
                 # there. We DON'T run TTS here so the GPU TTS work and the CPU/IO ffmpeg
-                # cuts overlap end-to-end.
+                # cuts overlap end-to-end. translate_full now also uses footage-cut (owner
+                # approach A), so it takes the same concurrent cut+TTS path.
                 _tts_thunk = _run_tts
                 audio = None
             else:
@@ -1700,7 +2276,7 @@ def _process_job(job: dict) -> None:
             # false-fail an empty-cut dubbed). assemble_dubbed already logs src vs out.
             visuals = {}
             visual_kind = "clip"
-        elif render_mode == "footage":
+        elif render_mode == "footage" or is_translate_full:
             # Reuse the source video already downloaded up-front for the audio
             # de-dup; only fall back to a fetch if it's somehow missing (defensive).
             if src_video is not None:
@@ -1800,6 +2376,21 @@ def _process_job(job: dict) -> None:
                     raise RuntimeError(f"scene {s['scene']}: no audio produced")
             _check_cancel(job_id)
 
+            # EARLY zero-tolerance duration gate (owner-requested). TTS has just produced
+            # every scene's VO with REAL probed durations; this is the EARLIEST point the
+            # actual output length is known. Fail NOW if VO + credit slate would meet or
+            # exceed the source — before whisper/encode/concat — instead of waiting for the
+            # post-assembly _enforce_duration_guard (kept below as the final backstop).
+            # Gated EXACTLY like that guard (source-tracking modes only) so original-length
+            # modes are never false-failed. has_slate_content mirrors assemble_footage's
+            # slate condition (logo/handle/source_name present).
+            if _mode_tracks_source(edit_mode):
+                _enforce_post_tts_duration(
+                    job_id, audio, scenes, _src_dur, add_credit,
+                    bool(source_logo or source_handle or source_name),
+                    outro_handle=outro_handle,
+                )
+
             visuals, f_scenes = {}, []
             for s, dest in cut_items:
                 r = audio[s["scene"]]
@@ -1814,20 +2405,42 @@ def _process_job(job: dict) -> None:
                 # unaffected. Fallback chain: display -> narration.
                 f_scenes.append(FootageScene(scene=s["scene"], clipPath=dest, audioPath=r["audioPath"],
                                              caption=s.get("display") or s["narration"],
-                                             durationS=_scene_clip_duration(s, r)))
-            _set_progress(job_id, "render", 85, "Dựng video 0%")
+                                             durationS=_scene_clip_duration(s, r),
+                                             # Deliberate beat silence (OmniVoice punctuation
+                                             # beats) so the pace pass can discount it; absent
+                                             # on cache hits -> 0.0, handled by the gap discount.
+                                             beatSilenceS=float(r.get("beatSilenceS") or 0.0)))
+            _set_progress(job_id, "render", 85,
+                          "Dựng video (dịch) 0%" if is_translate_full else "Dựng video 0%")
             set_ff_progress_cb(_assemble_progress_cb(job_id, "render"))
             try:
                 with _timed(job_id, "render"):
-                    res = assemble_footage(
-                        _with_src_audio_volume(
-                            FootageAssembleRequest(page=page_name, title=job_title, scenes=f_scenes,
-                                                   width=width, height=height, videoId=video_id,
-                                                   sourceName=source_name, sourceLink=source_link,
-                                                   sourceLogo=source_logo, sourceHandle=source_handle, addCredit=add_credit),
-                            src_audio_volume,
+                    if is_translate_full:
+                        # translate_full: footage-cut body (fit clips to VN VO, MUTED source,
+                        # Ken Burns zoom) + EasyOCR caption-cover run on the CUT video +
+                        # per-word karaoke over the cover band + credit slate. src audio is
+                        # always muted (no _with_src_audio_volume).
+                        res = assemble_translate_full(
+                            TranslateFullAssembleRequest(
+                                page=page_name, title=job_title, scenes=f_scenes,
+                                width=width, height=height, fps=30, videoId=video_id,
+                                sourceName=source_name, sourceLink=source_link,
+                                sourceLogo=source_logo, sourceHandle=source_handle,
+                                addCredit=add_credit, engine=vcm,
+                                captionBand=list(_translate_full_caption_band()),
+                            )
                         )
-                    )
+                    else:
+                        res = assemble_footage(
+                            _with_src_audio_volume(
+                                FootageAssembleRequest(page=page_name, title=job_title, scenes=f_scenes,
+                                                       width=width, height=height, videoId=video_id,
+                                                       sourceName=source_name, sourceLink=source_link,
+                                                       sourceLogo=source_logo, sourceHandle=source_handle, outroHandle=outro_handle, addCredit=add_credit,
+                                                       engine=vcm),
+                                src_audio_volume,
+                            )
+                        )
             finally:
                 set_ff_progress_cb(None)
             # HARD GUARD (owner-requested backstop): the finished footage video MUST be
@@ -1836,7 +2449,9 @@ def _process_job(job: dict) -> None:
             # source duration is known).
             # Section D: only enforce for SOURCE-TRACKING modes (summary/recap).
             # commentary/educational may legitimately exceed the source, so the guard
-            # would false-fail them — skip it there (default mode "commentary" is safe).
+            # would false-fail them — skip it there. translate_full keeps ~100% of the
+            # content so its output ~= source (not strictly shorter); it is NOT source-
+            # tracking, so the guard self-skips (would else false-fail it).
             if _mode_tracks_source(edit_mode):
                 _enforce_duration_guard(job_id, res, _src_dur)
             visual_kind = "clip"
@@ -1897,7 +2512,11 @@ def _process_job(job: dict) -> None:
                 # reads `narration`). Fallback chain: display -> narration.
                 f_scenes.append(FootageScene(scene=s["scene"], clipPath=dest, audioPath=r["audioPath"],
                                              caption=s.get("display") or s["narration"],
-                                             durationS=_scene_clip_duration(s, r)))
+                                             durationS=_scene_clip_duration(s, r),
+                                             # Deliberate beat silence (OmniVoice punctuation
+                                             # beats) so the pace pass can discount it; absent
+                                             # on cache hits -> 0.0, handled by the gap discount.
+                                             beatSilenceS=float(r.get("beatSilenceS") or 0.0)))
             _set_progress(job_id, "render", 85, "Dựng video 0%")
             set_ff_progress_cb(_assemble_progress_cb(job_id, "render"))
             try:
@@ -1907,7 +2526,8 @@ def _process_job(job: dict) -> None:
                             FootageAssembleRequest(page=page_name, title=job_title, scenes=f_scenes,
                                                    width=width, height=height, videoId=video_id,
                                                    sourceName=source_name, sourceLink=source_link,
-                                                   sourceLogo=source_logo, sourceHandle=source_handle, addCredit=add_credit),
+                                                   sourceLogo=source_logo, sourceHandle=source_handle, outroHandle=outro_handle, addCredit=add_credit,
+                                                   engine=vcm),
                             src_audio_volume,
                         )
                     )
@@ -1933,9 +2553,14 @@ def _process_job(job: dict) -> None:
             # %); forward each finished image into the image band [60,85] so the bar
             # advances live instead of freezing at 60 until assemble.
             LO_IMG, HI_IMG = 60, 85
+            # SDXL renders at the bucket matching the OUTPUT aspect (not the old
+            # hardcoded 768x1344 portrait), so a 16:9 / 1:1 / 4:5 job gets natively
+            # framed stills instead of a portrait image letterboxed with blur bars.
+            _sdxl_w, _sdxl_h = sdxl_dims_for_aspect(job.get("aspect"))
             imgs = generate_images(
                 ImagesRequest(
                     scenes=[ImageScene(scene=s["scene"], image_prompt=s["image_prompt"]) for s in scenes],
+                    width=_sdxl_w, height=_sdxl_h,
                     checkpoint=RENDER_CHECKPOINTS.get(rm),
                 ),
                 progress=lambda pct, msg: _set_progress(
@@ -1961,7 +2586,7 @@ def _process_job(job: dict) -> None:
                         AssembleRequest(page=page_name, title=job_title, scenes=a_scenes,
                                         width=width, height=height, videoId=video_id,
                                         sourceName=source_name, sourceLink=source_link,
-                                        sourceLogo=source_logo, sourceHandle=source_handle, addCredit=add_credit)
+                                        sourceLogo=source_logo, sourceHandle=source_handle, outroHandle=outro_handle, addCredit=add_credit)
                     )
             finally:
                 set_ff_progress_cb(None)
@@ -1972,10 +2597,20 @@ def _process_job(job: dict) -> None:
         # source audio is carried inside the assembled mp4, not as a separate asset).
         first_audio = (audio.get(scenes[0]["scene"], {}).get("audioPath")
                        if scenes else None)
-        thumb = make_thumbnail(res["videoPath"])
+        # No sibling .thumb.jpg is created and thumb_path stays NULL: the chosen cover
+        # (if any) is baked into the mp4 as its first frame by the FFmpeg assembly step.
+        # The FE renders the <video> first frame when thumbUrl is null; POST
+        # /api/videos/{id}/cover still sets a display-only poster after render.
         _save_assets(video_id, scenes, visuals, audio, visual_kind=visual_kind)
+        # Resolve the cover: the owner's MANUAL cover if one is attached, else coverless
+        # (auto-cover generation was removed — see _resolve_manual_cover). Then bake it into
+        # the mp4 as its FIRST FRAME (no-op when there's no cover). Must run BEFORE finalize
+        # so videos.video_path points at the baked file. In-place, no re-encode.
+        cover_to_bake = _resolve_manual_cover(job)
+        bake_cover_first_frame(res["videoPath"], cover_to_bake,
+                               res.get("width") or width, res.get("height") or height)
         _finalize_video(video_id, first_audio, res["videoPath"], res["durationS"],
-                        res.get("width"), res.get("height"), thumb)
+                        res.get("width"), res.get("height"), None)
 
         # 5) RENDER-CONTENT SNAPSHOT (must run BEFORE cleanup deletes intermediates).
         #    Copy this video's reusable content (script text + per-scene VISUAL +
@@ -2029,7 +2664,12 @@ def _process_job(job: dict) -> None:
         #    platform failed); we catch EVERYTHING here, log it, and leave the video
         #    'ready'. The video is already finalized at this point, so the job is a
         #    success regardless of the publish outcome.
-        if job.get("publish"):
+        if job.get("publish") and not API_UPLOAD_ENABLED:
+            # API upload kill-switch is ON: record the video as produced but skip the
+            # auto-publish entirely (never fail the job). The video stays 'ready'.
+            _set_progress(job_id, "publish", 95, "Hoàn tất (đăng qua API đang tạm tắt)")
+            print(f"[runner] job {job_id} auto-publish SKIPPED (API_UPLOAD_ENABLED is off)")
+        elif job.get("publish"):
             _set_progress(job_id, "publish", 95, "Đăng / hoàn tất")
             try:
                 # state defaults to DRAFT (safe) — matches the manual endpoint default;
@@ -2134,7 +2774,8 @@ def _recover_stale_jobs() -> None:
     with get_conn() as conn:
         rows = conn.execute(
             "UPDATE jobs SET status = 'failed',"
-            " error = 'interrupted by server restart', finished_at = now()"
+            " error = 'Công việc bị gián đoạn do máy chủ khởi động lại. Hãy chạy lại.',"
+            " finished_at = now()"
             " WHERE status = 'running' RETURNING id"
         ).fetchall()
         conn.execute("UPDATE videos SET status = 'failed' WHERE status = 'rendering'")

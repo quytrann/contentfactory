@@ -1,0 +1,29 @@
+{
+  "id": "chatcmpl-fixture",
+  "object": "chat.completion",
+  "created": 1785000000,
+  "model": "gemini-2.5-flash",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "[\n  {\n    \"scene\": 1,\n    \"narration\": \"Hai mươi năm trôi qua, chưa game kinh dị nào vượt được nó.\",\n    \"image_prompt\": \"Vertical 9:16 cinematic shot, fog-drenched empty street of a decaying American town, sodium streetlight, wet asphalt, heavy grain, muted sepia palette, dread\"\n  },\n  {\n    \"scene\": 2,\n    \"narration\": \"Nó không hù bạn bằng quái vật, mà hù bằng chính ký ức.\",\n    \"image_prompt\": \"Vertical 9:16, extreme close-up of a cracked mirror reflecting a blurred male face, cold blue light, dust motes, shallow depth of field, unsettling\"\n  },\n  {\n    \"scene\": 3,\n    \"narration\": \"James trở về thị trấn sương mù vì lá thư của người vợ đã mất.\",\n    \"image_prompt\": \"Vertical 9:16, a man in a green jacket standing at a rusted town sign, dense white fog swallowing the road behind him, overcast, desaturated\"\n  },\n  {\n    \"scene\": 4,\n    \"narration\": \"Nhưng người vợ ấy đã chết từ ba năm trước đó.\",\n    \"image_prompt\": \"Vertical 9:16, a faded handwritten letter on a car dashboard, rain on the windshield, soft grey daylight, melancholic, photographic realism\"\n  },\n  {\n    \"scene\": 5,\n    \"narration\": \"Mỗi con quái vật trong game là một mảnh tội lỗi của anh.\",\n    \"image_prompt\": \"Vertical 9:16, silhouetted distorted humanoid figure in a narrow hospital corridor, flickering fluorescent tube, peeling paint, high contrast, horror atmosphere\"\n  },\n  {\n    \"scene\": 6,\n    \"narration\": \"Pyramid Head không đuổi bạn, nó đang thi hành một bản án.\",\n    \"image_prompt\": \"Vertical 9:16, towering figure with a rusted metal pyramid helmet dragging an enormous blade along a concrete floor, sparks, backlit, low angle, oppressive\"\n  },\n  {\n    \"scene\": 7,\n    \"narration\": \"Thị trấn không hề dữ dội, nó chỉ phản chiếu thứ bạn chôn kín.\",\n    \"image_prompt\": \"Vertical 9:16, flooded apartment hallway reflecting a doorway like a mirror, still water, dim amber bulb, symmetrical composition, eerie calm\"\n  },\n  {\n    \"scene\": 8,\n    \"narration\": \"Cái kết thay đổi theo cách bạn chơi, không cần một lựa chọn nào.\",\n    \"image_prompt\": \"Vertical 9:16, three faint diverging paths in thick fog seen from above, muted monochrome, minimal, dreamlike, film grain\"\n  },\n  {\n    \"scene\": 9,\n    \"narration\": \"Đó là lý do nó vẫn là tượng đài, không phải trò hù rẻ tiền.\",\n    \"image_prompt\": \"Vertical 9:16, lone figure walking away into white fog at the end of a long pier, cinematic wide shot, cold desaturated tones, quiet finality\"\n  }\n]"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 980,
+    "completion_tokens": 1240,
+    "total_tokens": 2220
+  },
+  "_bench": {
+    "task": "topic_gamestory_60s",
+    "as_provider": "gemini",
+    "expect_verdict": "OK",
+    "latency_sec": 6.4,
+    "structured": "json_schema",
+    "note": "Happy path: bare JSON array, exact scene count, word count inside the band."
+  }
+}

@@ -1,14 +1,15 @@
 import { useEffect, useState } from 'react'
 import {
   Clapperboard,
+  History,
   LayoutGrid,
-  ListChecks,
   Moon,
   Send,
   Sun,
   Video as VideoIcon,
   Factory,
   Wand2,
+  Power,
 } from 'lucide-react'
 import Overview from './views/Overview'
 import Pages from './views/Pages'
@@ -18,8 +19,9 @@ import Jobs from './views/Jobs'
 import Videos from './views/Videos'
 import Publishing from './views/Publishing'
 import { PublishProvider } from './components/PublishModal'
-import { ToastProvider } from './ui'
-import { useData, useDataStatus } from './data'
+import { ToastProvider, Modal } from './ui'
+import { useData, useDataStatus, useNewVideos, useRefresh } from './data'
+import { api } from './api'
 
 type View = 'overview' | 'pages' | 'create-video' | 'jobs' | 'videos' | 'publishing' | 'page-detail'
 
@@ -27,8 +29,10 @@ const NAV = [
   { key: 'overview', label: 'Tổng quan', Icon: LayoutGrid },
   { key: 'create-video', label: 'Tạo Video', Icon: Wand2 },
   { key: 'videos', label: 'Video', Icon: VideoIcon },
+  // "Lịch sử Video" promoted to a top-level item, placed directly above "Trang"
+  // (was previously nested as a sub-item under "Trang").
+  { key: 'jobs', label: 'Lịch sử Job', Icon: History },
   { key: 'pages', label: 'Trang', Icon: Clapperboard },
-  { key: 'jobs', label: 'Lịch sử Video', Icon: ListChecks },
   { key: 'publishing', label: 'Thông tin Platform', Icon: Send },
 ] as const
 
@@ -37,7 +41,7 @@ const VIEW_LABEL: Record<string, string> = {
   overview: 'Tổng quan',
   pages: 'Trang',
   'create-video': 'Tạo Video',
-  jobs: 'Lịch sử Video',
+  jobs: 'Lịch sử Job',
   videos: 'Video',
   publishing: 'Thông tin Platform',
   'page-detail': 'Chi tiết trang',
@@ -83,6 +87,36 @@ export default function App() {
     () => (document.documentElement.dataset.theme as Theme) || 'dark',
   )
 
+  // "Exit dự án" flow. confirmOpen = the confirmation modal; shuttingDown = the
+  // full-screen "Đang tắt dự án…" overlay; done = the terminal "đã tắt" overlay.
+  // Once done is true the server is gone — this state is final (no retry / no
+  // reconnect banner over it).
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [shuttingDown, setShuttingDown] = useState(false)
+  const [done, setDone] = useState(false)
+
+  const handleShutdown = async () => {
+    setConfirmOpen(false)
+    setShuttingDown(true)
+    // Fire the shutdown. The server dies ~1.5s after responding, so a rejection
+    // here (network error) is EXPECTED — proceed regardless.
+    try {
+      await api.shutdownProject()
+    } catch {
+      /* server may already be tearing down — non-fatal */
+    }
+    // Give the backend killer time to begin before we try to close the tab.
+    await new Promise((r) => setTimeout(r, 1800))
+    // Likely blocked (tab wasn't opened by script), so we immediately swap to the
+    // terminal overlay telling the user they can close it themselves.
+    try {
+      window.close()
+    } catch {
+      /* ignore */
+    }
+    setDone(true)
+  }
+
   useEffect(() => {
     document.documentElement.dataset.theme = theme
     try {
@@ -106,8 +140,20 @@ export default function App() {
 
   const { loading, source } = useDataStatus()
   const { pages } = useData()
+  const { count: newVideoCount, markSeen: markVideosSeen } = useNewVideos()
+  const refresh = useRefresh()
 
   const toggleTheme = () => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))
+
+  // Navigate to a view. Opening "Video" clears the new-video badge and triggers a
+  // fresh data fetch so the grid shows the newly produced videos immediately.
+  const goToView = (key: View) => {
+    if (key === 'videos') {
+      markVideosSeen()
+      void refresh()
+    }
+    setView(key)
+  }
 
   const openPage = (id: number) => {
     setSelectedPageId(id)
@@ -127,16 +173,24 @@ export default function App() {
           {NAV.map(({ key, label, Icon }) => (
             <div key={key} className="flex flex-col">
               <button
-                onClick={() => setView(key)}
+                onClick={() => goToView(key)}
                 className={`flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition active:scale-[.98] ${
                   navActive === key ? 'bg-brand/10 text-brand ring-1 ring-inset ring-brand/20' : 'text-muted hover:bg-panel2 hover:text-fg'
                 }`}
               >
-                <Icon className="h-[18px] w-[18px]" />
+                <span className="relative">
+                  <Icon className="h-[18px] w-[18px]" />
+                  {/* New-video badge (notification dot) on the Video item. */}
+                  {key === 'videos' && newVideoCount > 0 && (
+                    <span className="absolute -right-2 -top-2 grid h-4 min-w-4 place-items-center rounded-full bg-rose-500 px-1 text-[10px] font-semibold leading-none text-white ring-2 ring-panel">
+                      {newVideoCount > 99 ? '99+' : newVideoCount}
+                    </span>
+                  )}
+                </span>
                 {label}
               </button>
-              {/* Sub-items under "Trang": the current pages, for one-click navigation. */}
-              {key === 'pages' && pages.length > 0 && (
+              {/* Sub-items under "Trang": individual page links. */}
+              {key === 'pages' && (
                 <div className="ml-4 mt-0.5 flex flex-col gap-0.5 border-l border-line pl-2">
                   {pages.map((p) => {
                     const active = view === 'page-detail' && selectedPageId === p.id
@@ -182,6 +236,15 @@ export default function App() {
             </div>
           )}
         </div>
+        <button
+          onClick={() => setConfirmOpen(true)}
+          title="Tắt toàn bộ dự án (API, ComfyUI, workers) và đóng tab"
+          aria-label="Tắt toàn bộ dự án (API, ComfyUI, workers) và đóng tab"
+          className="mt-2 flex w-full items-center justify-center gap-2 rounded-xl border border-rose-500/50 px-3 py-2 text-xs font-medium text-rose-600 transition hover:bg-rose-500/10 active:scale-[.98] dark:text-rose-400"
+        >
+          <Power className="h-4 w-4" />
+          Exit dự án
+        </button>
       </aside>
 
       {/* Main column */}
@@ -247,16 +310,68 @@ export default function App() {
         {NAV.map(({ key, label, Icon }) => (
           <button
             key={key}
-            onClick={() => setView(key)}
+            onClick={() => goToView(key)}
             className={`flex flex-1 flex-col items-center gap-1 py-2.5 text-[10px] font-medium transition ${
               navActive === key ? 'text-brand' : 'text-muted'
             }`}
           >
-            <Icon className="h-5 w-5" />
+            <span className="relative">
+              <Icon className="h-5 w-5" />
+              {key === 'videos' && newVideoCount > 0 && (
+                <span className="absolute -right-2 -top-1.5 grid h-4 min-w-4 place-items-center rounded-full bg-rose-500 px-1 text-[10px] font-semibold leading-none text-white ring-2 ring-panel">
+                  {newVideoCount > 99 ? '99+' : newVideoCount}
+                </span>
+              )}
+            </span>
             {label}
           </button>
         ))}
       </nav>
+
+      {/* Exit-project confirmation. */}
+      <Modal open={confirmOpen} onClose={() => setConfirmOpen(false)} title="Tắt dự án?">
+        <p className="text-sm text-muted">
+          Thao tác này sẽ dừng API, ComfyUI, vite và mọi tiến trình liên quan (PostgreSQL vẫn
+          chạy ngầm), rồi đóng tab. Mở lại bằng icon ContentFactory.
+        </p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            onClick={() => setConfirmOpen(false)}
+            className="rounded-xl px-4 py-2 text-sm font-medium text-muted transition hover:bg-panel2 hover:text-fg active:scale-[.98]"
+          >
+            Huỷ
+          </button>
+          <button
+            onClick={handleShutdown}
+            className="flex items-center gap-2 rounded-xl bg-rose-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-rose-500 active:scale-[.98]"
+          >
+            <Power className="h-4 w-4" />
+            Tắt dự án
+          </button>
+        </div>
+      </Modal>
+
+      {/* Full-screen shutdown overlay: in-progress spinner → terminal "đã tắt". */}
+      {shuttingDown && (
+        <div className="fixed inset-0 z-[100] flex flex-col items-center justify-center gap-4 bg-ink/95 backdrop-blur-sm">
+          {done ? (
+            <>
+              <div className="grid h-16 w-16 place-items-center rounded-full bg-rose-500/15 text-rose-500 ring-1 ring-inset ring-rose-500/30">
+                <Power className="h-8 w-8" />
+              </div>
+              <div className="text-center">
+                <div className="text-lg font-semibold text-fg">Dự án đã được tắt.</div>
+                <div className="mt-1 text-sm text-muted">Bạn có thể đóng tab này.</div>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="h-12 w-12 animate-spin rounded-full border-2 border-line border-t-rose-500" />
+              <div className="text-sm font-medium text-fg">Đang tắt dự án…</div>
+            </>
+          )}
+        </div>
+      )}
     </div>
     </PublishProvider>
     </ToastProvider>

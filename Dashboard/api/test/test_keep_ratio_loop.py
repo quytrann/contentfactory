@@ -11,9 +11,10 @@ The scene lists are built so _check_keep_ratio computes the intended ratio:
 window is pinned via TransformFootageRequest.windowSec; ratio = Σ(end-start)/window.
 Scenes already lie inside [0, window] so _clamp_footage_scenes leaves them unchanged.
 
-NOTE on attempt count: the code constant is `_RATIO_REGEN_ATTEMPTS = 2` (up to 2
-EXTRA regens), so the EXHAUST case caps at 1 + 2 = 3 total calls. We assert against
-the live constant, not a hardcoded 3, so the test tracks the source of truth.
+NOTE on attempt count: the code constant is `_RATIO_REGEN_ATTEMPTS = 1` (up to 1
+EXTRA regen as of the 2026-06-27 tuning pass), so the EXHAUST case caps at 1 + 1 = 2
+total calls. We assert against the live constant, not a hardcoded number, so the test
+tracks the source of truth.
 
 Run: cd Dashboard/api && .venv/Scripts/python.exe -m pytest test/test_keep_ratio_loop.py -q
 """
@@ -145,8 +146,10 @@ def test_recap_no_improvement_breaks_early(monkeypatch, caplog):
 # ---------------------------------------------------------------------------
 def test_recap_improving_uses_full_budget(monkeypatch, caplog):
     # recap band is [0.60, 0.75]. Start far over, get CLOSER each pass but never
-    # land in-band: 1.00 (d=0.25) -> 0.90 (d=0.15) -> 0.80 (d=0.05). Each step
-    # improves by 0.10 (> _RATIO_REGEN_MIN_IMPROVE), so no early break.
+    # land in-band. With _RATIO_REGEN_ATTEMPTS lowered to 1 (2026-06-27 tuning) the
+    # loop makes 1 + 1 = 2 calls total: 1.00 (d=0.25) -> 0.90 (d=0.15). The single
+    # regen improves by 0.10 (> _RATIO_REGEN_MIN_IMPROVE), so no early break; the
+    # budget is exhausted via the for/else "never reached band" path.
     spy = _SpyGen([1.00, 0.90, 0.80])
     monkeypatch.setattr(generate, "_gen_footage_scenes", spy)
 
@@ -157,8 +160,8 @@ def test_recap_improving_uses_full_budget(monkeypatch, caplog):
     assert spy.count == expected_calls, (
         f"a steadily-improving sequence must use the full budget ({expected_calls}), got {spy.count}"
     )
-    # Returns the CLOSEST attempt (the last, 0.80 — smallest band-distance).
-    assert abs(_kept_fraction(result) - 0.80) < 1e-9
+    # Returns the CLOSEST attempt seen within budget (the last call, 0.90 with 1 regen).
+    assert abs(_kept_fraction(result) - 0.90) < 1e-9
     # Exhausted via the for/else path (never improved INTO band) → "never reached band".
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("never reached band" in m for m in warnings), warnings
@@ -183,7 +186,7 @@ def test_commentary_no_band_single_call(monkeypatch):
 # 4. summary UNDER-band then IN-band → 1 regen, UNDER-clause nudge on 2nd call.
 # ---------------------------------------------------------------------------
 def test_summary_under_then_in_band(monkeypatch):
-    spy = _SpyGen([0.50, 0.82])  # 0.50 < 0.76 (under), 0.82 in [0.76, 0.90]
+    spy = _SpyGen([0.50, 0.80])  # 0.50 < 0.75 (under), 0.80 in [0.75, 0.85]
     monkeypatch.setattr(generate, "_gen_footage_scenes", spy)
 
     result = generate.generate_script_footage(_make_req("summary"))
@@ -193,8 +196,8 @@ def test_summary_under_then_in_band(monkeypatch):
     nudge = spy.calls[1]["ratio_nudge"]
     assert nudge is not None
     assert _RATIO_REGEN_UNDER in nudge
-    assert "~50%" in nudge and "76-90%" in nudge and "MODE summary" in nudge
-    assert abs(_kept_fraction(result) - 0.82) < 1e-9
+    assert "~50%" in nudge and "75-85%" in nudge and "MODE summary" in nudge
+    assert abs(_kept_fraction(result) - 0.80) < 1e-9
 
 
 if __name__ == "__main__":

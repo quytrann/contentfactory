@@ -58,12 +58,23 @@ def upload_video(
     tags: list[str] | None = None,
     privacy: str = "private",
     category_id: str = "20",   # 20 = Gaming
+    thumb_path: str | None = None,
 ) -> dict:
-    """Upload one MP4. Returns {ok, videoId?, url?, reason?}.
+    """Upload one MP4. Returns {ok, videoId?, url?, reason?, thumb?}.
 
     Never raises for the expected "not set up yet" cases — those come back as
     {"ok": False, "reason": ...} so the runner can leave the video as 'ready'
     rather than failing the whole job.
+
+    thumb_path (optional): a custom cover image. After a successful upload we call
+    youtube.thumbnails.set() BEST-EFFORT. Custom thumbnails require a VERIFIED
+    channel; if the channel isn't verified (or the scope is insufficient) the call
+    fails with 403 — we log it and STILL return ok:True for the upload (the video is
+    up). The thumbnail outcome is reported under the returned "thumb" key. Note:
+    thumbnails.set needs the broader `youtube.force-ssl` (or `youtube`) scope; our
+    tokens are minted with `youtube.upload` only, so this will typically report a
+    scope/verification gap until the owner re-consents with that scope — reported
+    honestly, never silently swallowed.
     """
     if not token_path:
         return {"ok": False, "reason": "no credentials_ref for this page's YouTube account"}
@@ -103,6 +114,37 @@ def upload_video(
         while response is None:
             _, response = request.next_chunk()
         vid = response["id"]
-        return {"ok": True, "videoId": vid, "url": f"https://youtu.be/{vid}", "privacy": privacy}
+        result = {"ok": True, "videoId": vid, "url": f"https://youtu.be/{vid}", "privacy": privacy}
+
+        # Custom thumbnail — BEST-EFFORT, never fails the (successful) upload.
+        if thumb_path:
+            result["thumb"] = _set_thumbnail(youtube, vid, thumb_path)
+        return result
     except Exception as exc:  # network/quota/auth errors — report, don't crash the job
         return {"ok": False, "reason": f"upload failed: {exc}"}
+
+
+def _set_thumbnail(youtube, video_id: str, thumb_path: str) -> dict:
+    """Set a custom thumbnail on an uploaded video via youtube.thumbnails.set.
+
+    BEST-EFFORT and NON-FATAL: returns {ok, reason?} and never raises. Custom
+    thumbnails require a VERIFIED channel and the `youtube`/`youtube.force-ssl`
+    scope; a missing verification or scope surfaces as a 403 we report but do not
+    treat as a publish failure. Meta/YouTube cap the image at 2MB.
+    """
+    if not thumb_path or not os.path.isfile(thumb_path):
+        return {"ok": False, "reason": "thumbnail file not found on disk"}
+    try:
+        if os.path.getsize(thumb_path) > 2 * 1024 * 1024:
+            return {"ok": False, "reason": "thumbnail exceeds YouTube's 2MB limit"}
+    except OSError:
+        pass
+    try:
+        from googleapiclient.http import MediaFileUpload
+        ext = os.path.splitext(thumb_path)[1].lower()
+        mimetype = "image/png" if ext == ".png" else "image/jpeg"
+        media = MediaFileUpload(thumb_path, mimetype=mimetype)
+        youtube.thumbnails().set(videoId=video_id, media_body=media).execute()
+        return {"ok": True}
+    except Exception as exc:  # 403 unverified/scope, quota, etc. — report, don't crash
+        return {"ok": False, "reason": f"thumbnail set failed: {exc}"}

@@ -1,0 +1,19 @@
+{
+  "id": "topic_gamestory_60s",
+  "label": "Topic -> 9 scenes, 60s, VN narration + EN image prompts",
+  "captured_from": "Dashboard/api/generate.py::_build_prompt (2026-07-30) + the FIXED word-budget line from _build_footage_prompt, merged into one standalone prompt",
+  "prompt_file": "topic_gamestory_60s.prompt.txt",
+  "system_prompt": "You output ONLY a valid JSON array of video script scenes. No prose, no markdown, no code fences, no explanation — just the JSON array.",
+  "schema_file": "scene_topic.schema.json",
+  "max_tokens": 4096,
+  "expect": {
+    "shape": "topic",
+    "required_keys": ["scene", "narration", "image_prompt"],
+    "scene_count": 9,
+    "scene_count_tolerance": 0,
+    "word_budget": 117,
+    "word_tolerance_pct": 10,
+    "target_duration_sec": 60
+  },
+  "notes": "Cheap smoke leg: short input, short output. Scene count is EXACT here ('exactly 9 scenes'), so tolerance is 0 - a leg that returns 8 or 10 has disobeyed."
+}

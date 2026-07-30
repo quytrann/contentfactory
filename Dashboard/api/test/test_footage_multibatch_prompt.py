@@ -61,7 +61,10 @@ class _SpyClaude:
     def __init__(self):
         self.prompts = []  # captured prompt arg, one per batch call
 
-    def __call__(self, prompt, timeout=None):
+    # force_regen is passed POSITIONALLY by _run_batches_parallel — keep it here or the
+    # executor raises TypeError before any assertion runs.
+    def __call__(self, prompt, timeout=None, cache_parts=None, batch_idx=0,
+                 force_regen=False):
         self.prompts.append(prompt)
         # Minimal valid scene list — the merge/renumber path only needs dicts with
         # a 'scene' key plus the standard footage fields.

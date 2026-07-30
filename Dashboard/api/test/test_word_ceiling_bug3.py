@@ -121,15 +121,36 @@ def test_in_budget_summary_passes(monkeypatch):
     assert generate._count_narration_words(out["scenes"]) == in_budget
 
 
-def test_at_tolerance_boundary_passes(monkeypatch):
-    """A script up to ceiling*tolerance is allowed (tolerance absorbs honest wobble)."""
-    ceiling = generate._auto_word_ceiling(WINDOW)
+def test_at_word_ceiling_passes_but_duration_gate_binds_above(monkeypatch):
+    """A script AT the word ceiling passes BOTH the word-ceiling check and the new
+    pre-TTS duration gate (its estimated VO is comfortably under source). But the
+    word-ceiling's 1.15x TOLERANCE no longer makes the UPPER boundary pass on its own:
+    the zero-tolerance duration gate (added 2026-06-27) is the stricter, more accurate
+    source-fit check, so a script at 1.15x the ceiling — whose estimated VO would EXCEED
+    the source — is correctly rejected. This pins the intended precedence: the duration
+    gate binds whenever the word-tolerance would otherwise admit an over-source script."""
     import math
-    limit = math.floor(ceiling * generate._WORD_CEILING_TOLERANCE)
+    ceiling = generate._auto_word_ceiling(WINDOW)
+    # (i) AT the ceiling → passes both gates.
     monkeypatch.setattr(generate, "_gen_footage_scenes",
-                        lambda *a, **k: _scenes_with_words(limit))  # exactly at the limit
+                        lambda *a, **k: _scenes_with_words(ceiling))
     out = generate.generate_script_footage(_make_req("summary"))  # must NOT raise
-    assert generate._count_narration_words(out["scenes"]) == limit
+    assert generate._count_narration_words(out["scenes"]) == ceiling
+    # Sanity: the ceiling's estimated VO really is under source.
+    est = ceiling / generate._VI_WORDS_PER_SEC + generate._CREDIT_SLATE_SEC
+    assert est < WINDOW, (est, WINDOW)
+
+    # (ii) AT 1.15x the ceiling → the word-ceiling tolerance would admit it, but its
+    # estimated VO exceeds source → the duration gate FAILS it (zero tolerance).
+    limit = math.floor(ceiling * generate._WORD_CEILING_TOLERANCE)
+    est_over = limit / generate._VI_WORDS_PER_SEC + generate._CREDIT_SLATE_SEC
+    assert est_over >= WINDOW, "premise: 1.15x ceiling must estimate OVER source"
+    monkeypatch.setattr(generate, "_gen_footage_scenes",
+                        lambda *a, **k: _scenes_with_words(limit))
+    with pytest.raises(HTTPException) as ei:
+        generate.generate_script_footage(_make_req("summary"))
+    assert ei.value.status_code == 422
+    assert "dài hơn hoặc bằng video gốc" in ei.value.detail
 
 
 # ---------------------------------------------------------------------------
@@ -144,13 +165,48 @@ def test_commentary_over_budget_does_not_fail(monkeypatch):
     assert generate._count_narration_words(out["scenes"]) == 8484
 
 
-def test_fixed_mode_summary_not_enforced(monkeypatch):
-    """Word ceiling enforcement is AUTO-only; a FIXED-target summary is exempt
-    (FIXED has its own prompt word budget, not source-tracking)."""
+def test_fixed_mode_extreme_blowup_fails_fast(monkeypatch):
+    """FIXED-mode FAST-FAIL (mechanism 3): a FIXED-target footage script whose total
+    narration grossly exceeds what the SOURCE span can physically hold must FAIL at
+    script-gen (422, Vietnamese message) instead of surfacing ~50 min later at the
+    assembly duration gate. This is the multi-batch budget-overshoot backstop — the
+    output VO must still fit under the source regardless of edit mode, so the FIXED
+    path now applies the SAME source-length ceiling the AUTO path uses (via
+    _enforce_fixed_source_fit). Replaces the old test that asserted FIXED was exempt:
+    that exemption is exactly what let job-45's 2661-word overshoot slip through to a
+    99% assembly failure."""
     monkeypatch.setattr(generate, "_gen_footage_scenes",
                         lambda *a, **k: _scenes_with_words(8484, n_scenes=20))
+    with pytest.raises(HTTPException) as ei:
+        generate.generate_script_footage(_make_req("summary", auto=False))
+    assert ei.value.status_code == 422
+    assert "vượt giới hạn từ" in ei.value.detail
+    assert "rút ngắn kịch bản" in ei.value.detail
+
+
+def test_fixed_mode_in_budget_passes(monkeypatch):
+    """A FIXED-target footage script that fits the source-length ceiling is returned
+    unchanged — the fast-fail only trips on a real overshoot, not on a normal script."""
+    ceiling = generate._auto_word_ceiling(WINDOW)  # 892 for 475s
+    in_budget = ceiling - 100
+    monkeypatch.setattr(generate, "_gen_footage_scenes",
+                        lambda *a, **k: _scenes_with_words(in_budget))
     out = generate.generate_script_footage(_make_req("summary", auto=False))
-    assert generate._count_narration_words(out["scenes"]) == 8484
+    assert generate._count_narration_words(out["scenes"]) == in_budget
+
+
+def test_fixed_source_fit_helper_unit():
+    """Direct unit of _enforce_fixed_source_fit: over → raise (mode-agnostic),
+    under → no-op, non-positive source → no-op."""
+    ceiling = generate._auto_word_ceiling(WINDOW)
+    over = _scenes_with_words(int(ceiling * 2))
+    under = _scenes_with_words(ceiling // 2)
+    with pytest.raises(HTTPException):
+        generate._enforce_fixed_source_fit(over, WINDOW)
+    # under → no raise
+    generate._enforce_fixed_source_fit(under, WINDOW)
+    # non-positive source → no raise (no honest ceiling)
+    generate._enforce_fixed_source_fit(over, 0)
 
 
 def test_enforce_helper_unit():

@@ -57,21 +57,21 @@ def test_recap_under_band():
 
 
 def test_summary_in_band():
-    # window=100, kept 82s → 0.82, inside summary band [0.76, 0.90]
-    clean = [_scene(0, 82)]
+    # window=100, kept 80s → 0.80, inside summary band [0.75, 0.85]
+    clean = [_scene(0, 80)]
     ratio, in_band, hint = _check_keep_ratio("summary", clean, 100.0)
-    assert abs(ratio - 0.82) < 1e-9, ratio
+    assert abs(ratio - 0.80) < 1e-9, ratio
     assert in_band is True
     assert hint is None
 
 
 def test_summary_under_band():
-    # window=100, kept 50s → 0.50 < 0.76 → UNDER nudge, band shown as 76-90%
+    # window=100, kept 50s → 0.50 < 0.75 → UNDER nudge, band shown as 75-85%
     clean = [_scene(0, 50)]
     ratio, in_band, hint = _check_keep_ratio("summary", clean, 100.0)
     assert in_band is False
     assert _RATIO_REGEN_UNDER in hint
-    assert "76-90%" in hint
+    assert "75-85%" in hint
     assert "MODE summary" in hint
 
 
@@ -103,7 +103,7 @@ def test_bad_window_never_blocks():
 
 def test_band_constants_match_guide():
     assert _KEEP_RATIO_BAND["recap"] == (0.60, 0.75)
-    assert _KEEP_RATIO_BAND["summary"] == (0.76, 0.90)
+    assert _KEEP_RATIO_BAND["summary"] == (0.75, 0.85)
 
 
 if __name__ == "__main__":

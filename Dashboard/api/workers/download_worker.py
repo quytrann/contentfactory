@@ -12,6 +12,14 @@ Invoked as: cf-venv/python.exe download_worker.py <input.json> <output.json>
 
 input.json:  {"link","outDir","window","maxHeight","ffmpegLocation"}
 output.json: {"videoPath","videoId","durationS","width","height"}
+
+THUMBNAIL mode (cover-from-source feature): when input.json carries
+`"mode":"thumbnail"` the worker does NOT download the video — it fetches only the
+source video's thumbnail image (yt-dlp writethumbnail + skip_download, converted to
+JPG via the project ffmpeg) into `outDir`, and returns its local path.
+
+input.json (thumbnail):  {"mode":"thumbnail","link","outDir","ffmpegLocation"}
+output.json (thumbnail): {"thumbPath","thumbUrl","videoId"}
 """
 
 import json
@@ -44,6 +52,79 @@ def _probed_duration(path: str, ffprobe_bin: str) -> float | None:
         return None
 
 
+def _apply_yt_hardening(ydl_opts: dict) -> None:
+    """Apply the shared YouTube 403 / throttling hardening (player-client ladder,
+    node JS runtime for nsig, retries). Mutates `ydl_opts` in place so both the
+    video download and the thumbnail fetch use the SAME nsig-free clients — a
+    thumbnail request hits the same extractor as a video request, so it needs the
+    same defenses. See the long comments in the video path below for the rationale."""
+    player_client = (os.getenv("YTDLP_PLAYER_CLIENT") or "").strip()
+    clients = ([c.strip() for c in player_client.split(",") if c.strip()]
+               if player_client else ["android_vr", "ios", "web_safari", "tv"])
+    ydl_opts["extractor_args"] = {"youtube": {"player_client": clients}}
+
+    js_rt = (os.getenv("YTDLP_JS_RUNTIME") or "node").strip()
+    rt_name, _, rt_path = js_rt.partition(":")
+    ydl_opts["js_runtimes"] = {rt_name.lower(): {"path": rt_path or None}}
+
+    ydl_opts.update({
+        "retries": 10,
+        "fragment_retries": 10,
+        "extractor_retries": 3,
+        "sleep_interval_requests": 1,
+    })
+
+
+def _fetch_thumbnail(cfg: dict, out_dir: str, ff: str | None, out_path: str) -> None:
+    """THUMBNAIL mode: fetch ONLY the source video's thumbnail (no video download).
+
+    Uses yt-dlp's writethumbnail + skip_download, then the FFmpegThumbnailsConvertor
+    postprocessor to guarantee a JPG (YouTube often serves .webp, which downstream
+    OCR/Pillow may not read reliably). Writes into `out_dir` and returns the local
+    JPG path. Reuses the same nsig-free player clients as the video path."""
+    import yt_dlp
+
+    os.makedirs(out_dir, exist_ok=True)
+    ydl_opts = {
+        "outtmpl": os.path.join(out_dir, "%(id)s_thumb.%(ext)s"),
+        "skip_download": True,
+        "writethumbnail": True,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        # Convert whatever YouTube serves (often webp) to JPG so OCR/Pillow read it.
+        "postprocessors": [
+            {"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"},
+        ],
+    }
+    if ff:
+        ydl_opts["ffmpeg_location"] = ff
+    _apply_yt_hardening(ydl_opts)
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(cfg["link"], download=True)
+
+    vid = info["id"]
+    # Preferred deterministic name from the outtmpl after JPG conversion.
+    thumb = os.path.join(out_dir, f"{vid}_thumb.jpg")
+    if not os.path.isfile(thumb):
+        # Fallback: the convertor may keep the original ext, or yt-dlp may have
+        # named it differently — pick the newest image file for this id.
+        import glob
+        cands = [p for ext in ("jpg", "jpeg", "png", "webp")
+                 for p in glob.glob(os.path.join(out_dir, f"{vid}_thumb.{ext}"))]
+        if not cands:
+            raise FileNotFoundError(f"thumbnail not downloaded for {vid}")
+        thumb = max(cands, key=os.path.getmtime)
+
+    out = {
+        "thumbPath": thumb,
+        "thumbUrl": info.get("thumbnail"),
+        "videoId": vid,
+    }
+    Path(out_path).write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+
+
 def main() -> None:
     in_path, out_path = sys.argv[1], sys.argv[2]
     cfg = json.loads(Path(in_path).read_text(encoding="utf-8"))
@@ -51,6 +132,12 @@ def main() -> None:
     ff = cfg.get("ffmpegLocation")
     if ff:
         os.environ["PATH"] = ff + os.pathsep + os.environ.get("PATH", "")
+
+    # Thumbnail-only mode: fetch the source thumbnail and exit (no video download).
+    if (cfg.get("mode") or "").strip().lower() == "thumbnail":
+        out_dir = cfg["outDir"]
+        _fetch_thumbnail(cfg, out_dir, ff, out_path)
+        return
 
     import yt_dlp
     from yt_dlp.utils import download_range_func
@@ -60,8 +147,37 @@ def main() -> None:
     window = int(cfg.get("window") or 0)
     max_h = int(cfg.get("maxHeight", 720))
 
+    # Source resolution FLOORS the final quality: a 720p landscape source upscaled
+    # to 1080x1920 is inherently soft, and downscaling a 1440p source to 1080 is
+    # sharper than a native 1080 source. So bias the picker toward ~1440p while
+    # never lowering an explicitly-higher cap (pref_h = max(cap, 1440)). The ladder
+    # falls back gracefully — best video up to the ceiling + best audio (merged to
+    # mp4), then best video of ANY height + audio, then any pre-muxed stream — so a
+    # source that only offers 720p still downloads instead of failing. This is
+    # strictly more permissive than the old `bv*[..]+ba/b[..]` (which had no
+    # unbounded fallback), so it never fails where the old selection succeeded.
+    #
+    # AUDIO: prefer m4a/AAC over webm/opus. Plain `ba` picks the highest-bitrate
+    # audio, which on YouTube is usually the webm/opus stream (fmt 251) — and that
+    # stream is sometimes served BROKEN by the CDN: the connection closes after
+    # ~992 bytes and every retry reproduces it ("992 bytes read, N more expected.
+    # Giving up after 10 retries"). It is deterministic per video, not a network
+    # flake, and yt-dlp's `/` ladder does NOT rescue it (`/` only falls back when a
+    # format is UNAVAILABLE, never when its download fails). The m4a stream (fmt
+    # 140) on the same video downloads fine, so ask for it first; the plain `+ba`
+    # branch stays right behind it for sources that only offer opus. Quality cost
+    # is negligible (AAC ~129kbps vs Opus ~118kbps) and downstream FFmpeg/whisper
+    # handle AAC natively.
+    pref_h = max(max_h, 1440)
+    fmt = (f"bv*[height<={pref_h}]+ba[ext=m4a]/"
+           f"bv*[height<={pref_h}]+ba/"
+           f"bv*+ba[ext=m4a]/"
+           f"bv*+ba/"
+           f"b[height<={pref_h}]/"
+           f"b")
+
     ydl_opts = {
-        "format": f"bv*[height<={max_h}]+ba/b[height<={max_h}]",
+        "format": fmt,
         "outtmpl": os.path.join(out_dir, "%(id)s_src.%(ext)s"),
         "merge_output_format": "mp4",
         "quiet": True,
@@ -70,6 +186,24 @@ def main() -> None:
     }
     if ff:
         ydl_opts["ffmpeg_location"] = ff
+
+    # --- YouTube 403 / throttling hardening -------------------------------------
+    # YouTube returns HTTP 403 ("Forbidden") on media URLs when yt-dlp's chosen
+    # client either can't solve the nsig JS challenge (the WEB client) or is being
+    # IP-throttled. Two defenses, both mirroring the CLI invocation that downloads
+    # reliably:
+    #
+    # 1) Player-client ladder. Default order prioritises clients that BOTH avoid the
+    #    web nsig challenge AND still expose high-res formats without a PO token:
+    #    android_vr (verified to yield 720p here and nsig-free) and ios first, then
+    #    web_safari (720p, needs nsig -> node, see below) and tv as last resorts.
+    #    yt-dlp tries them in order until one yields working media URLs. NOTE: plain
+    #    "android"/"tv" alone only expose ~360p here, so they must NOT lead the
+    #    ladder. Override with YTDLP_PLAYER_CLIENT (comma-separated) if YT rotates.
+    # 2) JS runtime for nsig (node; yt-dlp's default 'deno' is not installed here).
+    # 3) Transient-403 / throttling mitigations (retries + request pacing).
+    # All three live in _apply_yt_hardening so the thumbnail path shares them.
+    _apply_yt_hardening(ydl_opts)
 
     # Probe metadata first (no download) to learn the source duration so we can
     # decide whether a trim is genuine. Setting download_ranges=(0, window) with

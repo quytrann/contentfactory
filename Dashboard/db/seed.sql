@@ -93,4 +93,12 @@ ALTER TABLE platform_accounts
 ALTER TABLE metrics
     ADD COLUMN IF NOT EXISTS shares BIGINT;
 
+-- ---------------------------------------------------------------------------
+-- MIGRATION: posts — manual (hand-marked off-platform upload) column
+-- TRUE = user hand-marked the video as uploaded to the platform OUTSIDE the API
+-- (no real platform_post_id/url). Set by POST /api/videos/mark-posted.
+-- ---------------------------------------------------------------------------
+ALTER TABLE posts
+    ADD COLUMN IF NOT EXISTS manual BOOLEAN NOT NULL DEFAULT FALSE;
+
 -- No seed/sample data. Insert real pages via Dashboard/db/add_page.sql.

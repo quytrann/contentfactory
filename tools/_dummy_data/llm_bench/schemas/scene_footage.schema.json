@@ -1,0 +1,37 @@
+{
+  "name": "scene_list_footage",
+  "strict": true,
+  "schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["scenes"],
+    "properties": {
+      "scenes": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scene", "narration", "sourceStart", "sourceEnd"],
+          "properties": {
+            "scene": {
+              "type": "integer",
+              "description": "1-based scene number, contiguous"
+            },
+            "narration": {
+              "type": "string",
+              "description": "the spoken line, in Vietnamese"
+            },
+            "sourceStart": {
+              "type": "number",
+              "description": "start second in the source transcript for the illustrative clip"
+            },
+            "sourceEnd": {
+              "type": "number",
+              "description": "end second in the source transcript for the illustrative clip"
+            }
+          }
+        }
+      }
+    }
+  }
+}

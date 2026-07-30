@@ -1,0 +1,130 @@
+gmail: contentfactory.gamestory@gmail.com
+gmail: gmail
+facebook: Giải Thích Mọi Thứ / https://www.facebook.com/profile.php?id=61591266597244
+Fb.con-
+Youtube: CTG Gaming
+
+gmail: quytp.soju.korea@gmail.com
+gmail: gmail
+
+jake.independent@gmail.com
+gmail: gmail
+
+==============================================================================================
+https://www.youtube.com/@vutruscifi
+
+https://www.youtube.com/watch?v=bQDklPhnVrE
+
+khác:
+https://www.youtube.com/shorts/_HrxtU8BTaA
+
+Moon yb:
+https://www.youtube.com/watch?v=Bp2ai2MD4Mk
+
+ASTRYX:
+https://www.youtube.com/watch?v=ogXEv6nyQVg
+
+Be Smart:
+https://www.youtube.com/watch?v=xYu06Zn7JNQ]
+
+Kurzgesagt – In a Nutshell
+
+https://www.youtube.com/@hocgiaithuatcunghpn_official/shorts
+
+Blue Paw Print
+https://www.youtube.com/watch?v=hvdW156cTk4
+
+The Space Race
+https://www.youtube.com/watch?v=-_L5ZN-VnD0
+
+Primal Space
+https://www.youtube.com/watch?v=CsyQa8_9tlw
+
+neo
+https://www.youtube.com/watch?v=krSePO1QsDI
+
+@brainhook1
+https://www.youtube.com/@brainhook1/shorts
+
+KodeKloud
+https://www.youtube.com/@KodeKloud/shorts
+
+
+========================================
+
+Bước 1 — Kill sạch:
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+  Where-Object { $_.CommandLine -match 'uvicorn|multiprocessing|spawn_main' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+Get-NetTCPConnection -LocalPort 4000 -ErrorAction SilentlyContinue |
+  ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+
+Bước 2 — Start:
+Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Command','& d:\workspace\ContentFactory\Dashboard\api\run-api.ps1'
+
+Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile -Command "& Dashboard/api/run-api.ps1"'
+Invoke-WebRequest http://127.0.0.1:4000/api/pages -UseBasicParsing | Select-Object StatusCode
+
+
+========================================
+
+Lý do chính họ chưa bị claim nặng:
+
+Nội dung đã được "biến đổi" khá nhiều (Transformative Content)
+Họ không reup nguyên bản, mà dịch lời thoại, thay voice-over tiếng Việt, đôi khi chỉnh sửa cắt ghép, thêm hiệu ứng, subtitle.
+YouTube coi đây là nội dung có sự biến đổi, nên Content ID (hệ thống tự động) khó match 100% với video gốc.
+
+Chủ kênh gốc (Ruhi Cenet) chưa kích hoạt claim ở một số khu vực
+Ruhi Cenet là kênh Thổ Nhĩ Kỳ, có thể đang ưu tiên bảo vệ bản quyền ở Thổ Nhĩ Kỳ, châu Âu, Mỹ hơn là khu vực Việt Nam.
+Nhiều creator lớn không claim tất cả video reup dịch, vì họ thấy kênh reup giúp lan tỏa nội dung (miễn phí quảng cáo).
+
+Kỹ thuật né Content ID
+Nhiều kênh reup lớn dùng cách: thay audio hoàn toàn, thay đổi tốc độ một chút, cắt ghép, thêm intro/outro, thay đổi độ sáng/màu… để tránh hệ thống tự động nhận diện.
+
+YouTube ưu tiên nội dung bằng tiếng địa phương
+YouTube đôi khi "thả nổi" các kênh dịch sang tiếng Việt vì nó giúp mở rộng người xem ở khu vực non-English.
+
+========================================
+
+Cơ chế Content ID của YouTube là một trong những hệ thống tự động nhận diện bản quyền tiên tiến và mạnh nhất hiện nay.
+1. Content ID là gì?
+Content ID là hệ thống tự động quét và so sánh video mới upload với cơ sở dữ liệu khổng lồ của YouTube để phát hiện nội dung có bản quyền.
+Nó được ra mắt từ năm 2007 và liên tục được nâng cấp. Hiện tại (2026), Content ID có thể nhận diện:
+
+Hình ảnh
+Âm thanh (nhạc, lời thoại)
+Melody (giai điệu)
+Kết hợp hình + âm thanh
+
+2. Content ID hoạt động như thế nào?
+Quy trình 4 bước:
+
+Đăng ký bản quyền
+Chủ sở hữu nội dung (nhà sản xuất phim, ca sĩ, công ty giải trí, YouTuber lớn…) upload video gốc lên YouTube và đăng ký Content ID.
+Tạo "Digital Fingerprint"
+YouTube tạo ra một dấu vân tay số (fingerprint) rất phức tạp của video/âm thanh đó.
+Quét tự động
+Mỗi khi có video mới được upload, YouTube sẽ so sánh fingerprint của video đó với hàng tỷ fingerprint đã có trong database.
+Xử lý
+Nếu trùng khớp, YouTube sẽ tự động claim và thông báo cho chủ bản quyền.
+
+4. Ai có thể đăng ký Content ID?
+
+Kênh YouTube có 100.000 subscribers trở lên (điều kiện cơ bản).
+Các công ty lớn: Disney, Warner, Sony Music, Netflix, MrBeast, v.v.
+Kênh Việt Nam lớn cũng đã dùng Content ID rất nhiều.
+
+5. Những nội dung dễ bị Content ID claim nhất
+
+Phim, trailer, MV âm nhạc
+Nhạc bản quyền (nhạc không royalty-free)
+Gameplay không comment hoặc comment ít
+Video reup, dịch, dub lại từ kênh khác
+Nội dung từ các kênh lớn (Ruhi Cenet, Bright Side, Vsauce, Veritasium…)
+
+6. Lưu ý quan trọng năm 2026
+
+Content ID ngày càng thông minh hơn, có thể nhận diện cả video đã bị chỉnh sửa tốc độ, cắt ghép, thêm voice-over.
+Nếu bị claim nhiều, kênh dễ bị demonetize (không kiếm tiền được) hoặc nhận strike.
+Ghi credit ở cuối video không đủ để tránh Content ID.

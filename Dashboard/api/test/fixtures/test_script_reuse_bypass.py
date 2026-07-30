@@ -145,15 +145,31 @@ def spies(monkeypatch):
     monkeypatch.setattr(generate.subprocess, "Popen", _guarded_popen)
 
     # --- DB / video-row helpers ---
-    monkeypatch.setattr(runner, "_create_video", lambda job_id, page_id: 99999)
+    # Signature note: runner._create_video(job_id, page_id, facebook_tags=None) — the
+    # third arg was added after this fixture was written; accept it so the stub keeps
+    # matching the real call site (runner.py:1518).
+    monkeypatch.setattr(runner, "_create_video",
+                        lambda job_id, page_id, facebook_tags=None: 99999)
+    # 5th element (facebook_tags) mirrors the real _load_reusable_script signature
+    # (runner.py:329) — a non-empty value here lets tests verify the reuse path copies
+    # the source video's tags instead of firing a redundant claude -p hashtag call.
     monkeypatch.setattr(
         runner, "_load_reusable_script",
-        lambda src_id: ([dict(s) for s in _REUSE_RETURN["scenes"]], "Tieu de nguon", "Nguon Name", "https://src/link")
-        if src_id == SRC_VIDEO_ID else (None, None, None, None),
+        lambda src_id: ([dict(s) for s in _REUSE_RETURN["scenes"]], "Tieu de nguon", "Nguon Name",
+                        "https://src/link", "#tieuderused\n#test")
+        if src_id == SRC_VIDEO_ID else (None, None, None, None, None),
     )
     monkeypatch.setattr(runner, "_save_script", lambda *a, **k: None)
     monkeypatch.setattr(runner, "_save_assets", lambda *a, **k: None)
     monkeypatch.setattr(runner, "_finalize_video", lambda *a, **k: None)
+    # Auto Facebook-hashtag generation is a THIRD, independent `claude -p` call (runner.
+    # _auto_fill_fb_tags) added after this fixture was written — it fires on every
+    # produced video unless videos.facebook_tags is already set. It is out of scope for
+    # this suite (script-gen bypass specifically) and would otherwise trip the popen
+    # guard below, since _create_video is stubbed to skip the real INSERT its own
+    # NULL-check depends on. The reuse-path facebook_tags copy this fix added is real
+    # production code (runner.py, PART B) — covered separately, not by this stub.
+    monkeypatch.setattr(runner, "_auto_fill_fb_tags", lambda *a, **k: None)
     monkeypatch.setattr(runner, "_set_progress", lambda *a, **k: None)
     monkeypatch.setattr(runner, "_job_done", lambda jid: rec.__setitem__("done", True))
     monkeypatch.setattr(runner, "_job_failed", lambda jid, vid, msg: rec.__setitem__("failed", msg))

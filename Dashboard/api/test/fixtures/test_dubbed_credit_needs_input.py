@@ -188,6 +188,16 @@ def stubs(monkeypatch):
                 "width": 1080, "height": 1920}
     monkeypatch.setattr(runner, "assemble_dubbed", _spy_assemble)
 
+    # --- auto Facebook-hashtag generation: STUBBED, out of scope for this suite. ---
+    # _auto_fill_fb_tags (runner.py) is a THIRD, independent `claude -p` call — added
+    # after this fixture was written — that fires on every produced video (dubbed
+    # included) to auto-generate hashtags from the final content, unless
+    # videos.facebook_tags is already set. It is unrelated to the credit-decision flow
+    # this suite tests and would otherwise trip the `claude -p` guard below on every
+    # FRESH (non-reuse) dubbed job, since _create_video here doesn't insert a real row
+    # for it to find tags on.
+    monkeypatch.setattr(runner, "_auto_fill_fb_tags", lambda *a, **k: None)
+
     # --- guard the literal `claude -p` subprocess spawn (must never fire here) ---
     _real_popen = generate.subprocess.Popen
 

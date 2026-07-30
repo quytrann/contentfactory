@@ -9,3 +9,15 @@ python-multipart>=0.0.9,<0.1          # UploadFile (voice/image uploads)
 google-api-python-client>=2.0,<3.0
 google-auth-oauthlib>=1.2,<2.0
 google-auth-httplib2>=0.2,<0.3
+
+# HTTP client. Already present transitively (starlette's TestClient), pinned explicitly
+# because tools/llm_bench.py imports it directly: the free-tier LLM A/B harness talks to
+# OpenAI-compatible /chat/completions endpoints (Gemini AI Studio, OpenRouter, Z.ai,
+# local Ollama). Deliberately NOT the vendor `openrouter` SDK — one client shape covers
+# every leg, and the SDK would only abstract one of them.
+httpx>=0.27,<0.29
+
+# Desktop-window launcher (Dashboard/app.py). Wraps the same-origin dashboard in
+# a native window via the Windows WebView2 runtime (Edge Chromium). GUI-only —
+# not needed for the headless run-api.ps1 dev flow.
+pywebview>=6.0,<7.0

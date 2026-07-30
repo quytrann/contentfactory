@@ -24,6 +24,37 @@ import traceback
 from pathlib import Path
 
 
+def _apply_yt_hardening(ydl_opts: dict) -> None:
+    """Apply the shared YouTube bot-check / throttling hardening (player-client
+    ladder, node JS runtime for nsig, retries). Mutates `ydl_opts` in place.
+
+    Needed even for METADATA-ONLY fetches: yt-dlp's default "web" client
+    intermittently gets served "Sign in to confirm you're not a bot" on a plain
+    extract_info(download=False). The android_vr / ios clients don't trigger that
+    challenge and need no cookies or login.
+
+    Kept as a local copy rather than a shared import on purpose: every file in
+    this directory is a STANDALONE script invoked as
+    `cf-venv/python.exe <worker>.py in.json out.json` with stdlib-only top-level
+    imports and no cross-worker dependencies. Mirrors _apply_yt_hardening in
+    download_worker.py — keep the three copies in sync."""
+    player_client = (os.getenv("YTDLP_PLAYER_CLIENT") or "").strip()
+    clients = ([c.strip() for c in player_client.split(",") if c.strip()]
+               if player_client else ["android_vr", "ios", "web_safari", "tv"])
+    ydl_opts["extractor_args"] = {"youtube": {"player_client": clients}}
+
+    js_rt = (os.getenv("YTDLP_JS_RUNTIME") or "node").strip()
+    rt_name, _, rt_path = js_rt.partition(":")
+    ydl_opts["js_runtimes"] = {rt_name.lower(): {"path": rt_path or None}}
+
+    ydl_opts.update({
+        "retries": 10,
+        "fragment_retries": 10,
+        "extractor_retries": 3,
+        "sleep_interval_requests": 1,
+    })
+
+
 def _enable_cuda_dlls() -> None:
     """Put torch's bundled cuDNN9 / cuBLAS12 DLLs on the DLL search path so
     CTranslate2 (faster-whisper on CUDA) can load them. PATH alone is not honored
@@ -164,8 +195,14 @@ def _audio_from_local(link: str, local_media: str, out_dir: str, sample_rate: in
     # info dict derived from the local file.
     info: dict = {}
     try:
-        with yt_dlp.YoutubeDL({"skip_download": True, "quiet": True,
-                               "no_warnings": True, "noprogress": True}) as ydl:
+        # Metadata-only: the media is ALREADY downloaded locally, so a
+        # format-selection failure (DRM / "requested format not available") must
+        # not cost us the title/uploader used for the end credit.
+        meta_opts = {"skip_download": True, "quiet": True,
+                     "no_warnings": True, "noprogress": True,
+                     "ignore_no_formats_error": True}
+        _apply_yt_hardening(meta_opts)
+        with yt_dlp.YoutubeDL(meta_opts) as ydl:
             info = ydl.extract_info(link, download=False) or {}
     except Exception as e:
         print(f"[ingest] metadata fetch failed for local-media path ({e}); "
@@ -209,8 +246,13 @@ def _fetch_channel_logo(info: dict, out_dir: str) -> str | None:
     try:
         import yt_dlp
 
-        with yt_dlp.YoutubeDL({"skip_download": True, "playlist_items": "0",
-                               "quiet": True, "no_warnings": True}) as ydl:
+        # Channel page — an avatar fetch, never a media fetch, so formats are
+        # irrelevant here by construction.
+        chan_opts = {"skip_download": True, "playlist_items": "0",
+                     "quiet": True, "no_warnings": True,
+                     "ignore_no_formats_error": True}
+        _apply_yt_hardening(chan_opts)
+        with yt_dlp.YoutubeDL(chan_opts) as ydl:
             chan = ydl.extract_info(chan_url, download=False)
         thumbs = chan.get("thumbnails") or []
         avatar = next((t for t in thumbs if t.get("id") == "avatar_uncropped"), None)
@@ -306,6 +348,13 @@ def main() -> None:
         "title": info.get("title"),
         "uploader": info.get("uploader") or info.get("channel"),
         "handle": info.get("uploader_id"),        # e.g. "@KezzaZomboid"
+        # Extra source metadata — feeds the no-speech fallback (0 transcript
+        # segments) so Claude can describe the video from title/desc/tags even
+        # without spoken words. Old cached transcripts lack these keys; the
+        # backend tolerates their absence (falls back to fetch_source_metadata).
+        "description": info.get("description") or "",
+        "tags": info.get("tags") or [],
+        "categories": info.get("categories") or [],
         "logoPath": _fetch_channel_logo(info, os.path.dirname(info["audioPath"])),
         # Use the actually-transcribed audio length (correct even when clipped),
         # falling back to the source's full duration.

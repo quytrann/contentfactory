@@ -10,7 +10,7 @@ ContentFactory is an automated short-video production system (YouTube Shorts / R
 
 These are project rules that override default assumptions:
 
-- **Local & free only.** Prefer self-hosted/local tools (n8n self-host, VieNeu-TTS, faster-whisper, ComfyUI+SDXL, FFmpeg). Do **not** introduce paid APIs (no Anthropic API, no fal.ai, no cloud rendering) unless the owner explicitly approves a cost.
+- **Local & free only.** Prefer self-hosted/local tools (n8n self-host, F5-TTS+ViVoice / VieNeu-TTS, faster-whisper, ComfyUI+SDXL, FFmpeg). Do **not** introduce paid APIs (no Anthropic API, no fal.ai, no cloud rendering) unless the owner explicitly approves a cost.
 - **LLM = Claude Code headless, not the API.** Script/text generation runs via `claude -p "..." --output-format json` invoked from a command node — billed to the subscription, not per-token API.
 - **Borrowed account.** The logged-in Claude account is borrowed. Any creator / author / credit / channel / billing field belongs to the **project owner**, never the account holder. Leave such fields as `TODO_ASK_USER` and ask the owner — never infer them from the logged-in account.
 - **Target hardware: RTX 2070 Max-Q, 8GB VRAM.** Choose models that fit 8GB (SDXL, not full Flux). Models run **sequentially**, not concurrently. Disk/shared memory does not expand usable VRAM.
@@ -22,7 +22,7 @@ These are project rules that override default assumptions:
 - **Code language = English; Vietnamese ONLY for user-facing output (token discipline).** Write all **code comments, docstrings, and any model-facing prompt strings** (text sent to `claude -p` / an LLM) in **English** — Vietnamese tokenizes ~2–3× heavier (multi-byte diacritics), and script-gen prompts are billed to the Claude subscription. When adding a new LLM prompt, write the *instructions* in English but **explicitly mandate Vietnamese narration output** where the content language applies. Keep **Vietnamese ONLY** for genuinely user-facing text: dashboard UI (labels, hints, model/edit-mode descriptions, buttons, `SectionTitle` subs, status badges), progress messages written to the DB and shown in the dashboard (e.g. "Dựng video", "Lồng tiếng", "Viết kịch bản"), API error details surfaced to the user, the video **narration output**, and the Vietnamese voice-sample sentence. Do **not** "translate to save tokens" anything in that user-facing list — that would break the owner's Vietnamese dashboard. (Net: instructions/comments → English; what a human end-user reads or hears → Vietnamese.)
 - **Finished-video output lives OUTSIDE the repo** (media is large/regenerable). Convention: `E:\ContentFactory\<page name>` (e.g. GameStory → `E:\ContentFactory\GameStory`). Each page's `config/page.json` carries the concrete `output.video_dir`; the assembly step and `videos.video_path` should write there, not into the repo.
 - **Local tool binaries live under `E:\Installed\<Tool>`, never `C:\Program Files`** (machine convention — keeps the system drive small). When installing a tool that defaults to `C:` (e.g. winget/MSI), **move it to `E:\Installed\<Tool>` and reference that path.** Key binaries: Blender → `E:\Installed\Blender\blender.exe` (headless render: `blender -b -P <script.py>`; Blender is **Z-up**), FFmpeg/FFprobe → `E:\Installed\FFmpeg\...` (see `Dashboard/api/.env`), Python venv → `Dashboard/api/.venv`, psql → `E:\Installed\PostgreSQL16\bin`.
-- **Internet reading (Agent Reach).** To pull facts/topics/transcripts from real platforms (YouTube, RSS, any webpage, V2EX, Bilibili) use **Agent Reach** via the per-project wrapper `.\areach.ps1` at repo root (loads `.env` identity; `.env` is gitignored). The CLI itself only does `doctor`/`transcribe`/`setup` — actual reading = calling upstream tools directly (e.g. `yt-dlp --dump-json "URL"`, `yt-dlp --write-auto-sub …`), as documented in the `web-research` skill. Primary use = "watch" a YouTube video to mine topics / get its transcript to feed script-gen. No-subtitle fallback uses the project's **local faster-whisper**, not `agent-reach transcribe` (needs a paid key — left unset to stay local/free). **Never** run `agent-reach configure` (writes global creds, breaks per-project identity). Owned by the `researcher` agent; any agent or an on-demand request can call it.
+- **Internet reading.** To pull facts/topics/transcripts from real platforms use `yt-dlp` directly (already configured in this project — `--js-runtimes node` + `--ffmpeg-location` to the project FFmpeg). Primary use = mine a YouTube video's metadata/subtitles to feed script-gen (see `web-research` skill). No-subtitle fallback = project's local faster-whisper (`workers/whisper_worker.py`). Owned by the `researcher` agent.
 
 ## Architecture
 
@@ -50,19 +50,19 @@ The pipeline is the same entry/exit for all jobs; which steps run depends on `re
 **Image mode** (AI-generated visuals):
 ```
 Studio UI → job created → (link? yt-dlp + faster-whisper) → Claude Code (script JSON)
-         → VieNeu-TTS (audio) → faster-whisper (timestamps) → ComfyUI+SDXL (images)
+         → F5-TTS (audio) → faster-whisper (timestamps) → ComfyUI+SDXL (images)
          → FFmpeg (Ken Burns + captions + bgm) → upload → PostgreSQL
 ```
 
 **Footage mode** (translate/reup):
 ```
 Studio UI → job created → yt-dlp (download source) → faster-whisper (transcript)
-         → Claude Code (script JSON, edit_mode applied) → VieNeu-TTS (audio)
+         → Claude Code (script JSON, edit_mode applied) → F5-TTS (audio)
          → FFmpeg (cut source footage + captions + bgm) → upload → PostgreSQL
 ```
 
 Two non-obvious points:
-- **VieNeu-TTS does not emit timestamps.** Run faster-whisper on the generated audio to get per-line timestamps; those timestamps drive scene length and caption sync.
+- **F5-TTS does not emit timestamps.** Run faster-whisper on the generated audio to get per-line timestamps; those timestamps drive scene length and caption sync.
 - The **FFmpeg assembly step exceeds plain n8n** and is intended to be a small Python microservice called over HTTP — it is the only part expected to be hand-written code.
 
 ### Production modes (chosen per-job at creation time)
@@ -95,6 +95,25 @@ Full playbook: [how to edit video.md](how%20to%20edit%20video.md).
 footage/translate job, you MUST confirm `render_mode` and `edit_mode` with the owner.
 Do not assume a default — the mode changes the script, the original-footage ratio, and
 the assembly. Only proceed once the owner has chosen.
+
+## API server (mandatory — no exceptions)
+
+**Port:** `API_PORT=4000` (set in `Dashboard/api/.env`). Never assume port 8000 or any other port.
+
+**To restart:**
+1. **Sweep ALL orphaned workers, not just the port owner.** `uvicorn --reload` spawns `multiprocessing.spawn` worker children; on Windows the reloader parent can die while a worker keeps holding the `:4000` socket and serving STALE code. Kill every matching python process by command line, not by port:
+   ```powershell
+   Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+     Where-Object { $_.CommandLine -match 'uvicorn|multiprocessing|spawn_main' } |
+     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+   ```
+   Then also kill any remaining owner of port 4000: `Get-NetTCPConnection -LocalPort 4000 | ... Stop-Process`.
+2. Start: `Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile -Command "& Dashboard/api/run-api.ps1"'`
+3. Verify: `Invoke-WebRequest http://127.0.0.1:4000/api/pages` — must return 200.
+
+**Zombie-worker rule (mandatory).** A backend code fix that "doesn't take effect" after a restart is almost always orphaned workers serving stale code — **suspect zombies BEFORE re-editing the code.** Do NOT trust `Get-NetTCPConnection -LocalPort 4000` alone to find them: it mis-attributes the LISTEN socket to already-dead reloader PIDs, hiding the live orphan. Always run the command-line sweep in step 1. Tell-tale symptom: `/api/system` returns non-null `cpu.percent` (or stale RAM/VRAM) while the system is IDLE with no running job. After starting, confirm exactly ONE instance is listening.
+
+**Never** hardcode `--port 8000`. **Never** check `Get-NetTCPConnection -LocalPort 8000`. Always read `Dashboard/api/.env` for `API_PORT` before any start/verify command.
 
 ## Database
 

@@ -1,0 +1,26 @@
+{
+  "id": "footage_recap_600s",
+  "label": "10-min source transcript -> RECAP script (~40 scenes, <=1161 VN words)",
+  "captured_from": "Dashboard/api/generate.py::_build_footage_prompt (2026-07-30), editMode=recap, auto=True, window_start=0, window=600, scenes=40. Guide text = EDIT_MODE_GUIDE['recap']; safety rules 4/5/6 = _KEEP_ENGLISH_TERMS / _CUT_PROMO_FOOTAGE / _PROPER_NOUN_DENSITY; narration rule = _VI_FULL_TRANSLATION_RULE.",
+  "prompt_file": "footage_recap_600s.prompt.txt",
+  "system_prompt": "You output ONLY a valid JSON array of video script scenes. No prose, no markdown, no code fences, no explanation — just the JSON array.",
+  "schema_file": "scene_footage.schema.json",
+  "max_tokens": 16384,
+  "expect": {
+    "shape": "footage",
+    "required_keys": ["scene", "narration", "sourceStart", "sourceEnd"],
+    "scene_count": 40,
+    "scene_count_tolerance": 10,
+    "word_budget": 1161,
+    "word_budget_is_ceiling": true,
+    "word_tolerance_pct": 10,
+    "target_duration_sec": 600,
+    "source_window": [0, 600]
+  },
+  "notes": [
+    "This is the decisive leg. It stresses: long-context ingest (~9k chars of transcript), a HARD word CEILING (over = production reject), a soft scene target, and per-scene source ranges that must stay inside 0-600s.",
+    "scene_count is a SOFT target in the prompt, so tolerance is +/-10 scenes.",
+    "word_budget_is_ceiling=true changes the verdict rule: OVER the budget is a FAIL (the pipeline rejects it outright), UNDER by more than word_tolerance_pct is only a WARN (it means the model skipped source content).",
+    "The transcript is SYNTHETIC (written for this fixture; no real source video, no third-party text). Swap in a real captured transcript if you want to bench on production material."
+  ]
+}

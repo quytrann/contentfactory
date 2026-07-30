@@ -1,30 +1,34 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
 import {
-  Check, CheckCircle2, ChevronDown, ChevronRight as ChevronRightIcon, Clock, FileText, Film, Image as ImageIcon, Link2, Loader2, Mic,
-  Pencil, Play, Plus, RefreshCw, RotateCcw, SlidersHorizontal, Square, Trash2, Wand2, X,
+  AlignCenter, AlignLeft, AlignRight,
+  Check, CheckCircle2, ChevronDown, ChevronRight as ChevronRightIcon, ChevronUp, Clock, FileText, Film, FolderOpen, Image as ImageIcon, Link2, ListPlus, Loader2, Mic,
+  Pencil, Play, Plus, RefreshCw, RotateCcw, Save, Search, SlidersHorizontal, Square, Star, Trash2, Type, Wand2, X,
 } from 'lucide-react'
 import { useData, useRefresh, useStopJob } from '../data'
-import { api } from '../api'
-import type { ClonedVoice, ReusableScript, VideoScriptDetail, VoicesResponse } from '../api'
-import type { PlatformSpec } from '../types'
+import { ApiError, api } from '../api'
+import type { ClonedVoice, CoverResult, LlmModelOption, ReusableScript, VideoScriptDetail, VoicesResponse } from '../api'
+import type { BatchCreateBody, PlatformSpec } from '../types'
 import {
   Button, Card, EmptyState, Field, Modal, Pill, SectionTitle,
-  Select, TextInput, fmtClock, useToast,
+  Select, TextInput, fmtClock, getDefaultPref, setDefaultPref, clearDefaultPref, useToast,
 } from '../ui'
 // Reuse the SAME option-chip primitive + key→Vietnamese-label maps the Videos
 // view uses, so the Workflow's "selected options" row reads identically to the
 // chips on a finished video card (single source of truth, no label drift).
 import { EDIT_MODE_LABEL, OptionChip, RENDER_MODEL_LABEL, VOICE_CLONE_MODEL_LABEL } from './Videos'
+// Shared saved-cover browser, reused by the Videos list "Đổi cover" action.
+import { SavedCoverPicker } from '../components/SavedCoverPicker'
 
 // Three editing modes from `how to edit video.md`. The owner MUST pick one
 // before a workflow runs (CLAUDE.md pre-workflow rule).
 const EDIT_MODES = [
+  { value: 'summary', label: 'Summary', desc: 'Rút gọn video gốc còn các ý chính theo đúng trình tự; lời kể của bạn, footage gốc chỉ minh hoạ. Xem "how to edit video.md".' },
   { value: 'commentary', label: 'Commentary', desc: 'Dịch + phân tích & đưa quan điểm; footage gốc ≤ 20–40%.' },
   { value: 'recap', label: 'Recap', desc: 'Tóm tắt & kể lại có chọn lọc; sắp xếp lại, thêm giải thích.' },
   { value: 'educational', label: 'Giáo dục / Education', desc: 'Biến nội dung thành bài học / how-to / giải thích.' },
-  { value: 'summary', label: 'Summary', desc: 'Rút gọn video gốc còn các ý chính theo đúng trình tự; lời kể của bạn, footage gốc chỉ minh hoạ. Xem "how to edit video.md".' },
   { value: 'dubbed', label: 'Lồng phụ đề (Dubbed)', desc: 'Giữ nguyên hình + tiếng gốc, chỉ cắt phần thừa, burn phụ đề tiếng Việt; KHÔNG TTS. Cảnh báo: rủi ro bản quyền cao — owner đã chấp nhận.' },
+  { value: 'translate_full', label: 'Dịch đầy đủ (voice + phụ đề)', desc: 'Dịch nguyên bản toàn bộ nội dung sang giọng đọc tiếng Việt, giữ nguyên video gốc, che phụ đề gốc và chèn phụ đề tiếng Việt.' },
 ]
 
 // Render/animation engines available in the project (model-choices.md). The
@@ -98,7 +102,7 @@ const RENDER_MODELS = [
 
 // Render engines actually present/usable on this machine right now. The rest show
 // "— chưa cài" in the dropdown and block job creation until installed + wired.
-const INSTALLED_RENDER_MODELS = new Set(['passthrough-trim', 'sdxl-base', 'stickman-blender', 'stickman-procedural'])
+const INSTALLED_RENDER_MODELS = new Set(['passthrough-trim', 'sdxl-base', 'juggernaut-xl', 'stickman-blender', 'stickman-procedural'])
 
 // PART B (script reuse): collapse a render-model key into the high-level script
 // "mode" so a reused script can be cross-checked against the form's current model.
@@ -134,6 +138,15 @@ const VOICE_CLONE_MODELS = [
     desc: 'TTS tiếng Việt, clone zero-shot từ 1 đoạn mẫu ngắn. Đã cài (cf-venv), nhẹ.',
   },
   {
+    // NOTE: `short` MUST stay "OmniVoice" — the backend bakes it into cloned-voice
+    // names ("<name> - OmniVoice"), and BAKED_MODEL_SUFFIX is derived from this.
+    value: 'omnivoice',
+    installed: true,
+    short: 'OmniVoice',
+    label: 'OmniVoice (đa ngôn ngữ, clone)',
+    desc: 'Clone đa ngôn ngữ (gồm tiếng Việt) từ đoạn mẫu ngắn. Đã cài (cf-venv, GPU).',
+  },
+  {
     value: 'xtts-v2',
     installed: false,
     short: 'XTTS-v2',
@@ -155,6 +168,24 @@ const VOICE_CLONE_MODELS = [
     desc: 'Clone rất giống chỉ với mẫu ngắn, hỗ trợ tiếng Việt; fine-tune nhanh. Cần GPU. CHƯA CÀI.',
   },
 ]
+
+// Script-gen LLM ("Model AI viết kịch bản"). Unlike RENDER_MODELS /
+// VOICE_CLONE_MODELS there is NO static list here: the offered providers depend on
+// which API keys the backend has, so the options come from GET /api/llm/models at
+// runtime. What lives here is only the packing of a {provider, model} pair into
+// the single string value the shared <Select> primitive (and its localStorage
+// "set as default" ★) works with. `model` is null for claude-cli, so the encoded
+// key for it is simply "claude-cli|".
+const LLM_KEY_SEP = '|'
+
+// settingKey for the ★-pinned default LLM (`cf.default.studio.llmModel`). A const
+// because BOTH the <Select> and the post-create reset read it — an inline string in
+// two places is exactly how those two drift apart.
+const LLM_SETTING_KEY = 'studio.llmModel'
+
+function llmOptionKey(o: { provider: string; model: string | null }): string {
+  return `${o.provider}${LLM_KEY_SEP}${o.model ?? ''}`
+}
 
 // Output aspect ratios offered in the Studio.
 const ASPECT_OPTIONS = [
@@ -252,19 +283,197 @@ const PLATFORM_STYLE: Record<string, { selected: string; idle: string; logo: Rea
   },
 }
 
-// Studio form fields persisted to localStorage so navigating away and back doesn't reset them.
-const CF_STUDIO_KEY = 'cf-studio'
-type StudioSaved = {
-  link: string; title: string; editMode: string; renderModel: string
-  voiceCloneModel: string; aspect: string; targetSec: number
-  autoDuration: boolean; addCredit: boolean; srcAudioVolume: number
+// Default values for the Studio "Tạo video" per-job creation fields. These are the
+// initial state when there is no cached draft, and the values the form resets to
+// after a job is successfully created.
+const STUDIO_DEFAULTS = {
+  link: '',
+  title: '',
+  editMode: 'summary',
+  renderModel: 'passthrough-trim',
+  voiceCloneModel: 'f5-tts',
+  // Script-gen LLM, as an encoded "<provider>|<model>" key (see llmOptionKey).
+  // Deliberately EMPTY: the default is whatever GET /api/llm/models reports as
+  // is_default, resolved once the list arrives — never hardcoded here, so the
+  // backend can move its default without the form fighting it.
+  llmKey: '',
+  aspect: '16:9',
+  targetSec: 300,
+  autoDuration: true,
+  addCredit: false,
+  srcAudioVolume: 0,
+  // Cover draft fields (persist across refresh; cleared when the job completes).
+  // `cover` is the generated CoverResult (its `url` is a /media?path=… src that
+  // reloads the on-disk file after refresh); null = none generated yet.
+  cover: null as CoverResult | null,
+  useCover: false,
+  coverPrompt: '',
+  coverStyleIndex: 0,
+  // Cover title fields. `coverBasePath` is the CLEAN (title-less) cover path used as
+  // the compositing base for every renderCoverTitle call, so re-applying an edited
+  // title never stacks. `coverText` is the (editable) Vietnamese title, prefilled
+  // from the generate result's `viTitle`. `coverKeyWords` are the phrases the
+  // backend highlights when it fancy-styles the title (from the generate result).
+  coverBasePath: null as string | null,
+  coverText: '',
+  coverKeyWords: [] as string[],
+  // Manual title-style knobs. Most default to "Auto" (the backend does its
+  // seeded/auto thing); pinning a knob overrides it. Position "auto" = auto anchor;
+  // the *Auto booleans send null for the color/font/tilt values while on.
+  // EXCEPTION (owner request 2026-08-20): position / align / tilt are PINNED by
+  // default so a first-time "Tạo Cover" always lands middle-center, centered text,
+  // 0° tilt instead of the backend's seeded anchor/jitter. Re-generating an existing
+  // cover still preserves whatever the owner moved them to (makeCover never resets
+  // these) — the defaults only apply to a fresh form / after a job is submitted.
+  coverPosition: 'center',
+  coverAlign: 'center',
+  coverKeyColor: '#FF6600',
+  coverKeyColor2: '#0B3866',
+  coverKeyColorAuto: true,
+  coverGradient: true,
+  // Text BORDER (outline) color. Auto = backend picks a contrasting outline.
+  coverStrokeColor: '#000000',
+  coverStrokeAuto: true,
+  coverFontScale: 0.5,
+  coverFontAuto: true,
+  // tiltAuto=false + tilt=0 → the FE sends an explicit tiltDeg:0, which the backend
+  // honors as "flat" (`if ov_tilt is not None`). Leaving tiltAuto ON would instead
+  // let the seeded minority tilt the title, which is what the owner asked to stop.
+  coverTilt: 0,
+  coverTiltAuto: false,
+  // In-flight cover-generation task id. Persisted so the percent poll can RESUME
+  // after a page refresh (backend keeps the task ~600s). null = no task running.
+  coverTaskId: null as string | null,
+  createdJobId: null as number | null,
+} as const
+
+// The 9 title anchors (backend names), in reading order so a `grid-cols-3` lays
+// them out spatially (row 1 = top … row 3 = bottom; col 1 = left … col 3 = right).
+// The middle row is "center-left"/"center"/"center-right" (matches the API contract).
+const COVER_TITLE_ANCHORS = [
+  'top-left', 'top-center', 'top-right',
+  'center-left', 'center', 'center-right',
+  'bottom-left', 'bottom-center', 'bottom-right',
+] as const
+
+// localStorage key for the in-progress Studio draft. While the owner is filling in
+// the form (before submitting) the fields are cached here so navigating away and
+// back, or refreshing, does not lose what they typed. A successful create clears it.
+const STUDIO_DRAFT_KEY = 'cf-studio'
+
+// Marker for the one-time cover title position/align/tilt default migration
+// (see loadStudioDraft). Presence = the saved draft has already been migrated.
+const COVER_TITLE_DEFAULTS_MIGRATION_KEY = 'cf-studio.coverTitleDefaults.v2'
+
+// settingKey for the pinned default VOICE (a voiceKey like `clone:<name>`), stored
+// under `cf.default.studio.voice`. Shared by the VoicePicker's ★ affordance and the
+// fresh-form auto-select effect so the key can never drift between the two.
+const VOICE_DEFAULT_SETTING_KEY = 'studio.voice'
+
+// Persisted PER-VIDEO keep-script preference (shared with Videos.tsx): the set of
+// video ids whose saved script should be KEPT (media + audio still deleted) when
+// the video is removed from the history. Stored as a JSON array of ids under
+// `cf.keepScriptIds`. Exported helpers so both the reuse modal (which toggles a
+// row's flag) and Videos.tsx (which reads it on delete) hit the same key with no
+// drift.
+export const KEEP_SCRIPT_IDS_KEY = 'cf.keepScriptIds'
+
+export function getKeepScriptIds(): Set<number> {
+  try {
+    const raw = localStorage.getItem(KEEP_SCRIPT_IDS_KEY)
+    if (!raw) return new Set()
+    const arr = JSON.parse(raw)
+    return Array.isArray(arr) ? new Set(arr.filter((x): x is number => typeof x === 'number')) : new Set()
+  } catch {
+    return new Set()
+  }
 }
-function loadStudioSaved(): Partial<StudioSaved> {
-  try { return JSON.parse(localStorage.getItem(CF_STUDIO_KEY) ?? 'null') ?? {} }
-  catch { return {} }
+
+export function isKeepScript(id: number): boolean {
+  return getKeepScriptIds().has(id)
 }
-function saveStudioSaved(s: StudioSaved) {
-  try { localStorage.setItem(CF_STUDIO_KEY, JSON.stringify(s)) } catch { /* ignore */ }
+
+export function setKeepScript(id: number, keep: boolean): void {
+  try {
+    const ids = getKeepScriptIds()
+    if (keep) ids.add(id)
+    else ids.delete(id)
+    localStorage.setItem(KEEP_SCRIPT_IDS_KEY, JSON.stringify([...ids]))
+  } catch {
+    /* storage unavailable (private mode/quota) — best-effort */
+  }
+}
+
+// Shape of the persisted draft — exactly the per-job fields the form owns. Mirrors
+// STUDIO_DEFAULTS so the typed useState generics line up (STUDIO_DEFAULTS is `as const`).
+type StudioDraft = {
+  link: string
+  title: string
+  editMode: string
+  renderModel: string
+  voiceCloneModel: string
+  llmKey: string
+  aspect: string
+  targetSec: number
+  autoDuration: boolean
+  addCredit: boolean
+  srcAudioVolume: number
+  voiceKey: string
+  // Cover state (persisted so a generated cover survives refresh; see STUDIO_DEFAULTS).
+  cover: CoverResult | null
+  useCover: boolean
+  coverPrompt: string
+  coverStyleIndex: number
+  // Cover title draft fields (persist across refresh; see STUDIO_DEFAULTS).
+  coverBasePath: string | null
+  coverText: string
+  coverKeyWords: string[]
+  // Manual title-style knobs (persist across refresh; see STUDIO_DEFAULTS).
+  coverPosition: string
+  coverAlign: string
+  coverKeyColor: string
+  coverKeyColor2: string
+  coverKeyColorAuto: boolean
+  coverGradient: boolean
+  coverStrokeColor: string
+  coverStrokeAuto: boolean
+  coverFontScale: number
+  coverFontAuto: boolean
+  coverTilt: number
+  coverTiltAuto: boolean
+  // In-flight cover task id (persisted so the poll resumes across a refresh).
+  coverTaskId: string | null
+  // The job whose completion should clear the cover. Persisted so that if the user
+  // refreshes while the job is still running, the clear-on-done watch re-engages
+  // after reload and still fires when the job finishes. null = nothing to watch.
+  createdJobId: number | null
+}
+
+// Read the cached draft from localStorage, merged over the defaults so a partial or
+// stale draft (missing keys after a schema change) still yields a complete object.
+// Any parse/access failure (private mode, corrupt JSON) falls back to the defaults.
+function loadStudioDraft(): StudioDraft {
+  const base: StudioDraft = { ...STUDIO_DEFAULTS, voiceKey: '' }
+  try {
+    const raw = localStorage.getItem(STUDIO_DRAFT_KEY)
+    if (!raw) return base
+    const saved = JSON.parse(raw) as Partial<StudioDraft>
+    // One-time migration for the position/align/tilt default flip. A draft saved
+    // BEFORE the flip still carries the old auto values, and `{...base, ...saved}`
+    // would keep overriding the new defaults until the next job submit — so the
+    // first load after the flip drops just those keys and lets the new defaults
+    // through. Every other draft field (link, title, voice…) is preserved.
+    if (!localStorage.getItem(COVER_TITLE_DEFAULTS_MIGRATION_KEY)) {
+      localStorage.setItem(COVER_TITLE_DEFAULTS_MIGRATION_KEY, '1')
+      delete saved.coverPosition
+      delete saved.coverAlign
+      delete saved.coverTilt
+      delete saved.coverTiltAuto
+    }
+    return { ...base, ...saved }
+  } catch {
+    return base
+  }
 }
 
 // Pull a YouTube video id out of common URL shapes (watch / youtu.be / shorts / embed).
@@ -356,6 +565,7 @@ export function VoicePicker({
   page,
   onDeleted,
   className = '',
+  settingKey,
 }: {
   value: string
   onChange: (key: string) => void
@@ -363,17 +573,41 @@ export function VoicePicker({
   page: string
   onDeleted: () => void
   className?: string
+  // When set, each voice row shows a ★ to pin that voice as the default (stored
+  // under `cf.default.<settingKey>`). Mirrors the shared Select feature; the
+  // fresh-form auto-select in the parent reads the same key. Omit → no ★.
+  settingKey?: string
 }) {
   const [open, setOpen] = useState(false)
   const [confirming, setConfirming] = useState<VoiceOption | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // The pinned-default voiceKey (filled ★), read once on mount and updated on pin.
+  const [voiceDefault, setVoiceDefault] = useState<string | null>(() =>
+    settingKey ? getDefaultPref(settingKey) : null,
+  )
   const rootRef = useRef<HTMLDivElement>(null)
   const { success, error: toastError } = useToast()
 
   const options = useMemo(() => buildVoiceOptions(voices), [voices])
   const groups = useMemo(() => groupVoiceOptionsByModel(options), [options])
   const selected = options.find((o) => o.key === value)
+
+  // Pin/unpin a voice as the default (distinct from selecting it): persists to
+  // localStorage and flips that row's ★. Toggle — clicking the ★ of the CURRENT
+  // default un-pins it; clicking any other voice's ★ pins that one instead.
+  const pinDefault = (o: VoiceOption) => {
+    if (!settingKey) return
+    if (voiceDefault === o.key) {
+      clearDefaultPref(settingKey)
+      setVoiceDefault(null)
+      success('Đã bỏ giọng mặc định')
+    } else {
+      setDefaultPref(settingKey, o.key)
+      setVoiceDefault(o.key)
+      success('Đã đặt giọng mặc định')
+    }
+  }
 
   // Close on outside-click and Escape (only while the panel is open).
   useEffect(() => {
@@ -429,8 +663,11 @@ export function VoicePicker({
           ? `${selected.label} - ${selected.model}`
           : 'Chọn giọng…'
 
+  // Whether the CURRENTLY-SELECTED voice is the pinned default (drives the field ★).
+  const selectedIsDefault = !!settingKey && !!value && voiceDefault === value
+
   return (
-    <div ref={rootRef} className={`relative ${className}`}>
+    <div ref={rootRef} className={`group relative ${className}`}>
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
@@ -438,66 +675,147 @@ export function VoicePicker({
         aria-expanded={open}
         className="flex h-9 w-full items-center justify-between gap-2 rounded-lg border border-line bg-panel px-3 text-sm text-fg outline-none transition hover:border-brand/40 focus:border-brand/50 focus:ring-2 focus:ring-brand/20"
       >
-        <span className={`truncate ${selected ? 'text-fg' : 'text-muted'}`}>{triggerLabel}</span>
+        {/* pr reserves room so the field ★ sits left of the chevron, never over it. */}
+        <span className={`truncate ${settingKey && selected ? 'pr-7' : ''} ${selected ? 'text-fg' : 'text-muted'}`}>
+          {triggerLabel}
+        </span>
         <ChevronDown className={`h-4 w-4 shrink-0 text-muted transition ${open ? 'rotate-180' : ''}`} />
       </button>
+      {/* Field-level ★: mirrors the shared Select. Pins the CURRENTLY-SELECTED voice as
+          the default. Hidden when nothing is selected. Filled amber (always visible)
+          when the selected voice IS the default; outline on field hover otherwise. */}
+      {settingKey && selected && (
+        <button
+          type="button"
+          // preventDefault stops the wrapping <Field> <label> from forwarding the click
+          // to the trigger; stopPropagation keeps the panel from toggling.
+          onClick={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            pinDefault(selected)
+          }}
+          title={selectedIsDefault ? 'Đang là mặc định — bấm để bỏ' : 'Đặt làm mặc định'}
+          aria-label={selectedIsDefault ? 'Giọng đang là mặc định' : 'Đặt giọng đang chọn làm mặc định'}
+          aria-pressed={selectedIsDefault}
+          className={`absolute right-9 top-1/2 z-10 grid h-6 w-6 -translate-y-1/2 place-items-center rounded transition ${
+            selectedIsDefault
+              ? 'text-amber-500 opacity-100 dark:text-amber-400'
+              : 'text-muted opacity-0 hover:text-amber-500 focus:opacity-100 group-hover:opacity-100 dark:hover:text-amber-400'
+          }`}
+        >
+          <Star className={`h-3.5 w-3.5 ${selectedIsDefault ? 'fill-current' : ''}`} />
+        </button>
+      )}
 
       {open && (
-        <div className="absolute left-0 right-0 top-[calc(100%+4px)] z-30 max-h-72 overflow-y-auto rounded-lg border border-line bg-panel p-1 shadow-card">
+        <div className="absolute left-0 top-[calc(100%+4px)] z-30 max-h-72 min-w-[560px] max-w-[92vw] overflow-y-auto rounded-lg border border-line bg-panel p-1 shadow-card">
           {voices === null ? (
             <div className="px-3 py-2 text-sm text-muted">Đang tải giọng…</div>
-          ) : options.length === 0 ? (
-            <div className="px-3 py-2 text-sm text-muted">Chưa có giọng — bấm + để clone</div>
           ) : (
-            groups.map((g) => (
-              <div key={g.model} className="mb-1 last:mb-0">
-                <div className="px-2 pb-1 pt-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted/80">
-                  {g.model}
+            // Always render THREE side-by-side columns (F5-TTS / VieNeu / OmniVoice)
+            // regardless of content, so the fixed-engine structure is always visible.
+            // groupVoiceOptionsByModel already pins F5-TTS first and only returns
+            // models that HAVE voices, so we merge it over a fixed base (empty columns
+            // get a muted placeholder). REQUIRED_COLUMNS entries key on the engine's
+            // `short` value (VOICE_CLONE_MODELS[].short) — the same value baked into
+            // cloned-voice names and extracted by BAKED_MODEL_SUFFIX for grouping.
+            // Any extra model beyond these three flows into additional cells (grid-cols-3 wraps).
+            (() => {
+              const REQUIRED_COLUMNS = [PINNED_VOICE_MODEL, 'VieNeu', 'OmniVoice']
+              const byModel = new Map(groups.map((g) => [g.model, g.options]))
+              const columnModels = [
+                ...REQUIRED_COLUMNS,
+                ...groups.map((g) => g.model).filter((m) => !REQUIRED_COLUMNS.includes(m)),
+              ]
+              return (
+                <div className="grid grid-cols-3 gap-1">
+                  {columnModels.map((model) => {
+                    const opts = byModel.get(model) ?? []
+                    return (
+                      <div key={model} className="min-w-0">
+                        <div className="px-2 pb-1 pt-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted/80">
+                          {model}
+                        </div>
+                        {opts.length === 0 ? (
+                          <div className="px-2 py-1.5 text-xs text-muted/60">(chưa có giọng)</div>
+                        ) : (
+                          opts.map((o) => (
+                            <div
+                              key={o.key}
+                              role="button"
+                              tabIndex={0}
+                              // preventDefault stops the wrapping <label> (from <Field>) forwarding
+                              // this click to the trigger button, which would reopen the panel.
+                              onClick={(e) => {
+                                e.preventDefault()
+                                select(o.key)
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  e.preventDefault()
+                                  select(o.key)
+                                }
+                              }}
+                              className={`group flex cursor-pointer items-center justify-between gap-2 rounded-md px-2 py-1.5 text-sm transition ${
+                                o.key === value ? 'bg-brand/15 text-brand' : 'text-fg hover:bg-panel2'
+                              }`}
+                            >
+                              <span className="flex min-w-0 items-center gap-1.5">
+                                {o.key === value && <Check className="h-3.5 w-3.5 shrink-0" />}
+                                <span className="truncate">{o.label}</span>
+                              </span>
+                              <span className="flex shrink-0 items-center gap-0.5">
+                                {settingKey && (
+                                  <button
+                                    type="button"
+                                    // Pin as default (NOT the same as selecting). stopPropagation
+                                    // + preventDefault keep the row-select/label-forward from firing.
+                                    aria-label={
+                                      voiceDefault === o.key
+                                        ? `${o.label} đang là mặc định`
+                                        : `Đặt ${o.label} làm mặc định`
+                                    }
+                                    aria-pressed={voiceDefault === o.key}
+                                    title={voiceDefault === o.key ? 'Đang là mặc định — bấm để bỏ' : 'Đặt làm mặc định'}
+                                    onClick={(e) => {
+                                      e.preventDefault()
+                                      e.stopPropagation()
+                                      pinDefault(o)
+                                    }}
+                                    className={`grid h-6 w-6 place-items-center rounded transition ${
+                                      voiceDefault === o.key
+                                        ? 'text-amber-500 opacity-100 dark:text-amber-400'
+                                        : 'text-muted opacity-0 hover:bg-amber-500/10 hover:text-amber-500 focus:opacity-100 group-hover:opacity-100 dark:hover:text-amber-400'
+                                    }`}
+                                  >
+                                    <Star className={`h-3.5 w-3.5 ${voiceDefault === o.key ? 'fill-current' : ''}`} />
+                                  </button>
+                                )}
+                                {o.name && (
+                                  <button
+                                    type="button"
+                                    aria-label={`Xoá giọng ${o.label}`}
+                                    onClick={(e) => {
+                                      e.preventDefault()
+                                      e.stopPropagation()
+                                      setError(null)
+                                      setConfirming(o)
+                                    }}
+                                    className="grid h-6 w-6 place-items-center rounded text-muted opacity-0 transition hover:bg-rose-500/10 hover:text-rose-400 focus:opacity-100 group-hover:opacity-100"
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5" />
+                                  </button>
+                                )}
+                              </span>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    )
+                  })}
                 </div>
-                {g.options.map((o) => (
-                  <div
-                    key={o.key}
-                    role="button"
-                    tabIndex={0}
-                    // preventDefault stops the wrapping <label> (from <Field>) forwarding
-                    // this click to the trigger button, which would reopen the panel.
-                    onClick={(e) => {
-                      e.preventDefault()
-                      select(o.key)
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault()
-                        select(o.key)
-                      }
-                    }}
-                    className={`group flex cursor-pointer items-center justify-between gap-2 rounded-md px-2 py-1.5 text-sm transition ${
-                      o.key === value ? 'bg-brand/15 text-brand' : 'text-fg hover:bg-panel2'
-                    }`}
-                  >
-                    <span className="flex min-w-0 items-center gap-1.5">
-                      {o.key === value && <Check className="h-3.5 w-3.5 shrink-0" />}
-                      <span className="truncate">{o.label}</span>
-                    </span>
-                    {o.name && (
-                      <button
-                        type="button"
-                        aria-label={`Xoá giọng ${o.label}`}
-                        onClick={(e) => {
-                          e.preventDefault()
-                          e.stopPropagation()
-                          setError(null)
-                          setConfirming(o)
-                        }}
-                        className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted opacity-0 transition hover:bg-rose-500/10 hover:text-rose-400 focus:opacity-100 group-hover:opacity-100"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    )}
-                  </div>
-                ))}
-              </div>
-            ))
+              )
+            })()
           )}
         </div>
       )}
@@ -778,6 +1096,82 @@ const SCRIPT_MODE_LABEL: Record<string, string> = {
   stickman: 'Stickman',
 }
 
+// mm:ss (or h:mm:ss) timestamp for Dubbed subtitle rows. Unlike ui.tsx's fmtClock,
+// a 0s start renders as "0:00" (a real timestamp), not an em-dash placeholder.
+function fmtTs(total: number): string {
+  const s = Math.max(0, Math.round(total || 0))
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = s % 60
+  const mm = h ? String(m).padStart(2, '0') : String(m)
+  return `${h ? `${h}:` : ''}${mm}:${String(sec).padStart(2, '0')}`
+}
+
+// Escape a user-typed string for safe use inside a RegExp (search highlighting).
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+// Split `text` on case-insensitive occurrences of `query` and render each match
+// as a <mark>. `matchStart` is the running match index across the whole script;
+// the match whose global index === `activeMatch` gets the "current" highlight so
+// Prev/Next can visually focus one match. Returns the rendered nodes plus the
+// number of matches found in this text (so the caller can advance matchStart).
+function highlightMatches(
+  text: string,
+  query: string,
+  matchStart: number,
+  activeMatch: number,
+): { nodes: React.ReactNode[]; count: number } {
+  if (!query.trim()) return { nodes: [text], count: 0 }
+  const re = new RegExp(escapeRegExp(query), 'gi')
+  const nodes: React.ReactNode[] = []
+  let last = 0
+  let count = 0
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) nodes.push(text.slice(last, m.index))
+    const globalIdx = matchStart + count
+    const isActive = globalIdx === activeMatch
+    nodes.push(
+      <mark
+        key={`${m.index}-${count}`}
+        data-search-match={globalIdx}
+        className={
+          isActive
+            ? 'rounded bg-amber-400 px-0.5 text-[#0a0c12]'
+            : 'rounded bg-amber-400/30 px-0.5 text-fg'
+        }
+      >
+        {m[0]}
+      </mark>,
+    )
+    last = m.index + m[0].length
+    count++
+    // Guard against zero-length matches (shouldn't happen with escaped literals).
+    if (m.index === re.lastIndex) re.lastIndex++
+  }
+  if (last < text.length) nodes.push(text.slice(last))
+  return { nodes, count }
+}
+
+// Newest-first ordering for the reusable-script list. The backend DOES order its
+// DB rows created_at DESC, but it then APPENDS orphaned-manifest items (createdAt
+// null, os.listdir order) after them — and a future change to that endpoint's
+// default order must not silently break the UI guarantee. So we sort here, at the
+// point of render, using only fields the API already returns:
+//   1. rows that have a createdAt come first, newest timestamp on top;
+//   2. rows without one (source='manifest' — genuinely undated) go last;
+//   3. videoId DESC breaks every tie (ids are monotonic → newest id first).
+function compareScriptsNewestFirst(a: ReusableScript, b: ReusableScript): number {
+  const ta = a.createdAt ? Date.parse(a.createdAt) : NaN
+  const tb = b.createdAt ? Date.parse(b.createdAt) : NaN
+  const va = Number.isNaN(ta), vb = Number.isNaN(tb)
+  if (va !== vb) return va ? 1 : -1          // undated items sink to the bottom
+  if (!va && ta !== tb) return tb - ta       // both dated → newest first
+  return b.videoId - a.videoId               // tie / both undated → highest id first
+}
+
 // Modal that lists previously-produced videos whose script can be reused (skip
 // script-gen). Fetches GET /api/pages/{pageId}/reusable-scripts on open, narrowed
 // by the current source link when present. Each row shows title/source, scene
@@ -821,6 +1215,20 @@ function ReusableScriptPicker({
   // "script edited since audio was synthesized" when the picked script is reused
   // WITH cached audio (Button 2) — a cache HIT would then serve stale audio.
   const [editedVideoIds, setEditedVideoIds] = useState<Set<number>>(new Set())
+  // Per-video "keep script on delete" set (shared with Videos.tsx via the
+  // KEEP_SCRIPT_IDS_KEY helpers). localStorage is the source of truth; this local
+  // Set mirror re-renders the row toggles when the owner flips one.
+  const [keepIds, setKeepIds] = useState<Set<number>>(getKeepScriptIds)
+  const toggleKeepScript = (videoId: number, keep: boolean) => {
+    setKeepScript(videoId, keep)
+    setKeepIds(getKeepScriptIds())
+  }
+
+  // Search-within-script: query text + which match (0-based, across the whole
+  // expanded script) is the "current" one for Prev/Next focus. Reset whenever the
+  // expanded script changes (see the expandedId effect below).
+  const [search, setSearch] = useState('')
+  const [activeMatch, setActiveMatch] = useState(0)
 
   const toast = useToast()
 
@@ -855,9 +1263,10 @@ function ReusableScriptPicker({
     setEditSaving(true)
     try {
       await api.updateSceneNarration(videoId, sceneNum, editText.trim())
-      // Update local detail state so the UI reflects the change immediately
+      // Update local detail state so the UI reflects the change immediately.
+      // Dubbed scripts have no scenes and no inline edit path, so leave them as-is.
       setDetail(prev => {
-        if (!prev) return prev
+        if (!prev || prev.kind === 'dubbed') return prev
         return {
           ...prev,
           scenes: prev.scenes.map(sc =>
@@ -927,10 +1336,13 @@ function ReusableScriptPicker({
   useEffect(() => () => stopAudio(), [])
 
   // Stop audio when the user collapses or switches to a different script preview.
+  // Also reset the in-script search so matches/indices don't carry across scripts.
   useEffect(() => {
     stopAudio()
     setPlayingScene(null)
     setEditingScene(null)
+    setSearch('')
+    setActiveMatch(0)
   }, [expandedId])
 
   useEffect(() => {
@@ -961,6 +1373,42 @@ function ReusableScriptPicker({
       .finally(() => !cancelled && setDetailLoading(false))
   }
 
+  // Always render newest-first, independent of the order the API happened to return.
+  // Copy before sorting — never mutate the state array in place.
+  const sortedScripts = useMemo(
+    () => (scripts ? scripts.slice().sort(compareScriptsNewestFirst) : null),
+    [scripts],
+  )
+
+  const expandedScript = expandedId !== null && scripts
+    ? scripts.find(s => s.videoId === expandedId) ?? null
+    : null
+
+  // Total search matches across the expanded script's narrations (case-insensitive).
+  const totalMatches = useMemo(() => {
+    // Search applies to scene narrations only; dubbed transcripts have no scenes.
+    if (!search.trim() || !detail || detail.kind === 'dubbed') return 0
+    const re = new RegExp(escapeRegExp(search), 'gi')
+    return detail.scenes.reduce((sum, sc) => sum + ((sc.narration ?? '').match(re)?.length ?? 0), 0)
+  }, [search, detail])
+
+  // Keep activeMatch in range whenever the query or match count changes.
+  useEffect(() => {
+    if (activeMatch >= totalMatches) setActiveMatch(totalMatches > 0 ? totalMatches - 1 : 0)
+  }, [totalMatches, activeMatch])
+
+  // Scroll the active <mark> into view when navigating between matches.
+  useEffect(() => {
+    if (!search.trim() || totalMatches === 0) return
+    const el = document.querySelector(`[data-search-match="${activeMatch}"]`)
+    el?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  }, [activeMatch, search, totalMatches, detail])
+
+  const gotoMatch = (delta: number) => {
+    if (totalMatches === 0) return
+    setActiveMatch((cur) => (cur + delta + totalMatches) % totalMatches)
+  }
+
   return (
     <Modal open onClose={onClose} title="Dùng kịch bản đã tạo trước đó" maxWidthClass="max-w-2xl">
       <div className="space-y-3">
@@ -968,6 +1416,61 @@ function ReusableScriptPicker({
           Chọn một kịch bản đã tạo trước đó để dùng lại — pipeline sẽ BỎ QUA bước viết kịch bản (tiết kiệm thời gian & chi phí).
           {link.trim() ? ' Đang lọc theo link nguồn hiện tại.' : ' Hiện mọi kịch bản đã lưu của trang này.'}
         </p>
+
+        {/* Search-within-script — only when a script preview is expanded (that's
+            where the script text lives). Highlights matches in the narration,
+            shows match count, and Prev/Next jump between matches. Hidden for
+            dubbed transcripts (no scene narration to search). */}
+        {detail && detail.kind !== 'dubbed' && (
+          <div className="flex items-center gap-1.5">
+            <div className="relative flex-1">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
+              <input
+                type="text"
+                value={search}
+                onChange={(e) => { setSearch(e.target.value); setActiveMatch(0) }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') { e.preventDefault(); gotoMatch(e.shiftKey ? -1 : 1) }
+                }}
+                placeholder="Tìm trong kịch bản…"
+                className="h-9 w-full rounded-lg border border-line bg-panel pl-8 pr-16 text-sm text-fg outline-none transition placeholder:text-muted/70 focus:border-brand/50 focus:ring-2 focus:ring-brand/20"
+              />
+              {search && (
+                <div className="absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-1">
+                  <span className="text-[11px] tabular-nums text-muted">
+                    {totalMatches > 0 ? `${activeMatch + 1}/${totalMatches}` : '0/0'}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => { setSearch(''); setActiveMatch(0) }}
+                    aria-label="Xoá tìm kiếm"
+                    className="grid h-5 w-5 place-items-center rounded text-muted transition hover:bg-panel2 hover:text-fg"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => gotoMatch(-1)}
+              disabled={totalMatches === 0}
+              aria-label="Kết quả trước"
+              className="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-line bg-panel text-muted transition hover:text-fg disabled:opacity-40"
+            >
+              <ChevronUp className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => gotoMatch(1)}
+              disabled={totalMatches === 0}
+              aria-label="Kết quả kế tiếp"
+              className="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-line bg-panel text-muted transition hover:text-fg disabled:opacity-40"
+            >
+              <ChevronDown className="h-4 w-4" />
+            </button>
+          </div>
+        )}
 
         {scripts === null && !error && (
           <div className="flex items-center gap-2 py-6 text-sm text-muted">
@@ -981,9 +1484,9 @@ function ReusableScriptPicker({
           </p>
         )}
 
-        {scripts !== null && scripts.length > 0 && (
+        {sortedScripts !== null && sortedScripts.length > 0 && (
           <ul className="max-h-[60vh] space-y-2 overflow-y-auto pr-0.5">
-            {scripts.map((s) => {
+            {sortedScripts.map((s) => {
               const heading = s.title?.trim() || s.sourceName?.trim() || `Video #${s.videoId}`
               const modeLabel = s.renderMode ? SCRIPT_MODE_LABEL[s.renderMode] ?? s.renderMode : null
               const expanded = expandedId === s.videoId
@@ -993,9 +1496,16 @@ function ReusableScriptPicker({
                     <div className="min-w-0 flex-1">
                       <p className="truncate text-sm font-medium text-fg">{heading}</p>
                       <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                        <Pill tone="brand">{s.sceneCount} cảnh</Pill>
+                        {/* Dubbed scripts carry no scene array (sceneCount is 0), so
+                            "0 cảnh" would wrongly read as empty — show a mode badge. */}
+                        {s.editMode === 'dubbed'
+                          ? <Pill tone="amber">Lồng tiếng</Pill>
+                          : <Pill tone="brand">{s.sceneCount} cảnh</Pill>}
                         {modeLabel && <Pill tone="sky">{modeLabel}</Pill>}
                         {s.editMode && <Pill tone="slate">{s.editMode}</Pill>}
+                        {/* Manifest-only scripts live on disk (no DB row) and never
+                            carry a reusable audio cache → only fresh-audio reuse. */}
+                        {s.source === 'manifest' && <Pill tone="slate">Chỉ manifest</Pill>}
                       </div>
                       {s.preview && (
                         <p className="mt-1.5 line-clamp-2 text-xs text-muted">{s.preview}</p>
@@ -1026,6 +1536,24 @@ function ReusableScriptPicker({
                             ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
                             : <Trash2 className="h-3.5 w-3.5" />}
                       </button>
+                      {/* Per-video keep-on-delete flag (shared with Videos.tsx). Only
+                          for DB-backed scripts — a manifest-only row has no DB video
+                          row to delete, so the flag is meaningless there. */}
+                      {s.source === 'manifest' ? (
+                        <span className="text-[10px] text-muted/60" title="Không có bản ghi video để xóa">
+                          Giữ khi xóa —
+                        </span>
+                      ) : (
+                        <label className="flex cursor-pointer items-center gap-1 text-[10px] text-muted" title="Khi xóa video ở lịch sử, giữ lại kịch bản để tái dùng (chỉ xóa media + audio)">
+                          <input
+                            type="checkbox"
+                            checked={keepIds.has(s.videoId)}
+                            onChange={(e) => toggleKeepScript(s.videoId, e.target.checked)}
+                            className="h-3.5 w-3.5 rounded border-line bg-panel accent-[var(--color-brand)]"
+                          />
+                          Giữ khi xóa
+                        </label>
+                      )}
                     </div>
                   </div>
 
@@ -1037,9 +1565,44 @@ function ReusableScriptPicker({
                         </div>
                       )}
                       {detailError && <p className="text-xs text-rose-400">Không tải được: {detailError}</p>}
-                      {detail && !detailLoading && !detailError && (
+                      {/* Dubbed transcript: read-only timestamped VN subtitle list. */}
+                      {detail && !detailLoading && !detailError && detail.kind === 'dubbed' && (
+                        <div>
+                          <div className="mb-2 flex items-center gap-2">
+                            <Pill tone="amber">Phụ đề lồng tiếng</Pill>
+                            <span className="text-[11px] text-muted">{detail.subs.length} dòng</span>
+                          </div>
+                          <ol className="space-y-1.5">
+                            {detail.subs.map((sub, i) => (
+                              <li key={i} className="flex gap-2 text-xs">
+                                <span className="shrink-0 tabular-nums text-muted/80">
+                                  {fmtTs(sub.start)} → {fmtTs(sub.end)}
+                                </span>
+                                <span className="text-fg">{sub.text_vi}</span>
+                              </li>
+                            ))}
+                          </ol>
+                        </div>
+                      )}
+                      {/* Scene-array script (image/footage/stickman): existing render,
+                          kept unchanged. `kind !== 'dubbed'` also covers a legacy
+                          response missing `kind` (backward-safe). */}
+                      {detail && !detailLoading && !detailError && detail.kind !== 'dubbed' && (
                         <ol className="space-y-2">
-                          {detail.scenes.map((sc) => (
+                          {(() => {
+                            // Running count of matches BEFORE each scene, so each
+                            // scene's highlighted marks get a unique global index
+                            // for Prev/Next focus. Computed once per render pass.
+                            let offset = 0
+                            const sceneOffsets = detail.scenes.map((sc) => {
+                              const start = offset
+                              if (search.trim()) {
+                                const re = new RegExp(escapeRegExp(search), 'gi')
+                                offset += (sc.narration ?? '').match(re)?.length ?? 0
+                              }
+                              return start
+                            })
+                            return detail.scenes.map((sc, sceneIdx) => (
                             <li key={sc.scene} className="text-xs">
                               <span className="font-semibold text-muted">Cảnh {sc.scene}.</span>{' '}
                               {editingScene === sc.scene ? (
@@ -1072,7 +1635,11 @@ function ReusableScriptPicker({
                                 </span>
                               ) : (
                                 <span className="inline-flex items-start gap-1">
-                                  <span className="text-fg">{sc.narration}</span>
+                                  <span className="text-fg">
+                                    {search.trim()
+                                      ? highlightMatches(sc.narration, search, sceneOffsets[sceneIdx], activeMatch).nodes
+                                      : sc.narration}
+                                  </span>
                                   <button
                                     type="button"
                                     title="Sửa nội dung cảnh này"
@@ -1130,7 +1697,8 @@ function ReusableScriptPicker({
                                 </p>
                               )}
                             </li>
-                          ))}
+                            ))
+                          })()}
                         </ol>
                       )}
                     </div>
@@ -1141,7 +1709,12 @@ function ReusableScriptPicker({
           </ul>
         )}
 
-        <div className="flex justify-end pt-1">
+        <div className="flex justify-end gap-2 pt-1">
+          {expandedScript && (
+            <Button onClick={() => onPick(expandedScript, editedVideoIds.has(expandedScript.videoId))}>
+              <Check className="h-4 w-4" /> Dùng
+            </Button>
+          )}
           <Button variant="ghost" onClick={onClose}>Đóng</Button>
         </div>
       </div>
@@ -1180,6 +1753,254 @@ function ReusableScriptPicker({
   )
 }
 
+// ---- Batch "Add List" --------------------------------------------------
+
+// Settings snapshot passed from the Studio: exactly the create-time fields a batch
+// job shares with a single "Tạo video" (BatchCreateBody minus pageId + per-link
+// items, which the modal supplies). Read from the SAME Studio state as create().
+type BatchSettings = Omit<BatchCreateBody, 'pageId' | 'items'>
+
+// One manual row in the modal's editable grid: the owner types BOTH the source
+// link and the Vietnamese title. A row counts as valid (→ becomes a job) only
+// when both fields are non-empty. `id` is a stable key so rows can be reordered/
+// removed without React key collisions on empty/duplicate links.
+interface BatchRow {
+  id: number
+  link: string
+  title: string
+}
+
+// Modal (mirrors SavedCoverPicker's Modal usage): a manual row grid — no probe/
+// preview/translate. The owner types each source link + its Vietnamese title,
+// then Save enqueues one queued job per fully-filled row (POST /api/jobs/batch)
+// with the CURRENT Studio settings. The runner processes them sequentially; the
+// owner watches progress in "Lịch sử Job".
+function BatchListModal({
+  pageId,
+  settings,
+  hasOuterLink,
+  onAdoptFirst,
+  onClose,
+  onCreated,
+}: {
+  pageId: number
+  settings: BatchSettings
+  // Whether the Studio's outer source-link input already has a link. When it is
+  // EMPTY, the batch's first row is moved into that input (onAdoptFirst) instead of
+  // being saved as a held job — otherwise every batch link would be 'held' with no
+  // outer link, leaving "Tạo video" disabled (it requires a non-empty outer link)
+  // and the held rows unrunnable. The remaining rows are still saved as held.
+  hasOuterLink: boolean
+  onAdoptFirst: (link: string, title: string) => void
+  onClose: () => void
+  onCreated: () => Promise<void>
+}) {
+  const { success, error: toastError } = useToast()
+  // Monotonic row-id source (never reused), so removing a row never lets a later
+  // new row reuse a stale key.
+  const nextId = useRef(5)
+  // Start with 5 empty rows.
+  const [rows, setRows] = useState<BatchRow[]>(() =>
+    Array.from({ length: 5 }, (_, i) => ({ id: i, link: '', title: '' })),
+  )
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+  // Per-link create failures, shown after a batch save (kept until re-save/close).
+  const [failures, setFailures] = useState<{ link: string; error: string }[]>([])
+  // Per-row title-probe in flight (row id → true), for the small spinner.
+  const [probing, setProbing] = useState<Record<number, boolean>>({})
+
+  // A row becomes a job only when BOTH link and title are non-empty (blanks skipped).
+  const validRows = rows.filter((r) => r.link.trim() && r.title.trim())
+
+  const addRow = () => setRows((prev) => [...prev, { id: nextId.current++, link: '', title: '' }])
+  const removeRow = (id: number) =>
+    setRows((prev) => (prev.length <= 1 ? prev : prev.filter((r) => r.id !== id)))
+  const editRow = (id: number, patch: Partial<Pick<BatchRow, 'link' | 'title'>>) =>
+    setRows((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)))
+
+  // Per-row debounce timers for the auto-title probe (cleared on unmount).
+  const probeTimers = useRef<Record<number, ReturnType<typeof setTimeout>>>({})
+  useEffect(() => () => Object.values(probeTimers.current).forEach(clearTimeout), [])
+
+  // On link edit, debounce a lightweight metadata probe and, when it resolves,
+  // auto-fill the SOURCE video's title into the still-empty title cell. We only
+  // fill when the row still holds the same link AND its title is empty — so a
+  // title the owner typed (or already auto-filled + edited) is never clobbered.
+  const scheduleTitleProbe = (id: number, rawLink: string) => {
+    const link = rawLink.trim()
+    const timers = probeTimers.current
+    if (timers[id]) clearTimeout(timers[id])
+    if (!/^https?:\/\//i.test(link)) {
+      setProbing((p) => { const n = { ...p }; delete n[id]; return n })
+      return
+    }
+    setProbing((p) => ({ ...p, [id]: true }))
+    timers[id] = setTimeout(() => {
+      api.probeLink(link)
+        .then((res) => {
+          const t = res?.title?.trim()
+          if (!t) return
+          setRows((prev) =>
+            prev.map((r) =>
+              r.id === id && r.link.trim() === link && !r.title.trim() ? { ...r, title: t } : r,
+            ),
+          )
+        })
+        .catch(() => undefined)
+        .finally(() => setProbing((p) => { const n = { ...p }; delete n[id]; return n }))
+    }, 600)
+  }
+
+  const editLink = (id: number, v: string) => {
+    editRow(id, { link: v })
+    scheduleTitleProbe(id, v)
+  }
+
+  const doSave = async () => {
+    if (validRows.length === 0) return
+    setSaving(true)
+    setErr(null)
+    setFailures([])
+    try {
+      // When the Studio's outer link input is EMPTY, adopt the first row into it so
+      // "Tạo video" enables (it requires a non-empty outer link) and pressing it runs
+      // the first link + releases the held rest. The remaining rows are saved as held.
+      // If the outer input already has a link, keep every row as held (old behavior).
+      let toHold = validRows
+      if (!hasOuterLink && validRows.length > 0) {
+        const first = validRows[0]
+        onAdoptFirst(first.link.trim(), first.title.trim())
+        toHold = validRows.slice(1)
+      }
+
+      // Only the adopted link (nothing left to hold): the first link is now in the
+      // Studio input — nudge the owner to press "Tạo video".
+      if (toHold.length === 0) {
+        success('Đã điền link đầu vào Studio — bấm "Tạo video" để chạy')
+        onClose()
+        return
+      }
+
+      const body: BatchCreateBody = {
+        pageId,
+        items: toHold.map((r) => ({ link: r.link.trim(), title: r.title.trim() })),
+        ...settings,
+      }
+      const res = await api.batchCreateJobs(body)
+      const created: number[] = []
+      const failed: { link: string; error: string }[] = []
+      for (const r of res.results) {
+        if ('jobId' in r) created.push(r.jobId)
+        else failed.push({ link: r.link, error: r.error })
+      }
+      await onCreated()
+      if (created.length > 0) {
+        success(
+          hasOuterLink
+            ? `Đã lưu ${created.length} nguồn (sẽ chạy khi bấm Tạo video)`
+            : `Đã điền link đầu vào Studio + lưu ${created.length} nguồn còn lại — bấm "Tạo video" để chạy tất cả`,
+        )
+      }
+      if (failed.length > 0) {
+        setFailures(failed)
+        toastError(`${failed.length} link lỗi`)
+      }
+      // Close only when every link succeeded; otherwise keep the modal open so the
+      // owner can see which links failed.
+      if (failed.length === 0) onClose()
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+      toastError('Lưu hàng loạt thất bại')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Modal open onClose={onClose} title="Thêm danh sách video" maxWidthClass="max-w-3xl">
+      <div className="space-y-3">
+        <p className="text-xs text-muted">
+          Nhập từng dòng: link nguồn (trái) và tiêu đề (phải). Dán link xong sẽ tự lấy tiêu đề của video nguồn điền
+          vào ô tiêu đề (bạn có thể sửa lại). Chỉ những dòng có ĐỦ cả link lẫn tiêu đề mới được lưu. Các nguồn được lưu
+          lại (chưa chạy) với đúng thiết lập hiện tại của Studio; chúng sẽ tự chạy khi bạn bấm "Tạo video".
+        </p>
+
+        {/* Column header */}
+        <div className="grid grid-cols-[1fr_1fr_auto] items-center gap-2 px-0.5 text-[11px] font-medium text-muted">
+          <span>Link nguồn</span>
+          <span>Tiêu đề tiếng Việt</span>
+          <span className="w-8" aria-hidden />
+        </div>
+
+        <div className="max-h-[46vh] space-y-2 overflow-y-auto pr-0.5">
+          {rows.map((r) => (
+            <div key={r.id} className="grid grid-cols-[1fr_1fr_auto] items-center gap-2">
+              <TextInput
+                value={r.link}
+                onChange={(v) => editLink(r.id, v)}
+                placeholder="https://youtube.com/watch?v=…"
+                className="w-full"
+              />
+              <div className="relative">
+                <TextInput
+                  value={r.title}
+                  onChange={(v) => editRow(r.id, { title: v })}
+                  placeholder={probing[r.id] ? 'Đang lấy tiêu đề nguồn…' : 'Tiêu đề (tự động lấy từ link)…'}
+                  className="w-full"
+                />
+                {probing[r.id] && (
+                  <Loader2 className="pointer-events-none absolute right-2 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-muted" />
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => removeRow(r.id)}
+                disabled={rows.length <= 1}
+                title="Xoá dòng"
+                aria-label="Xoá dòng"
+                className="flex h-8 w-8 items-center justify-center rounded-lg border border-line text-muted transition hover:border-rose-500/40 hover:text-rose-400 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-line disabled:hover:text-muted"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          ))}
+        </div>
+
+        <div className="flex items-center justify-between">
+          <Button variant="outline" onClick={addRow} disabled={saving}>
+            <Plus className="h-4 w-4" /> Thêm dòng
+          </Button>
+          <span className="text-[11px] text-muted">{validRows.length} dòng hợp lệ</span>
+        </div>
+
+        {err && <p className="text-xs text-rose-400">{err}</p>}
+
+        {failures.length > 0 && (
+          <div className="rounded-lg border border-rose-500/40 bg-rose-500/5 px-3 py-2">
+            <p className="text-xs font-medium text-rose-400">{failures.length} link không tạo được:</p>
+            <ul className="mt-1 space-y-0.5">
+              {failures.map((f) => (
+                <li key={f.link} className="truncate text-[11px] text-muted" title={`${f.link} — ${f.error}`}>
+                  {f.link} — <span className="text-rose-400">{f.error}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        <div className="flex items-center justify-end gap-2 pt-1">
+          <Button variant="ghost" onClick={onClose} disabled={saving}>Đóng</Button>
+          <Button onClick={doSave} disabled={saving || validRows.length === 0}>
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+            {saving ? 'Đang lưu…' : `Lưu (${validRows.length})`}
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  )
+}
+
 // ---- Studio ------------------------------------------------------------
 
 function Studio({
@@ -1196,30 +2017,41 @@ function Studio({
   onCreated: () => Promise<void>
 }) {
   const { success, error: toastError } = useToast()
-  const _saved = useMemo(() => loadStudioSaved(), [])
-  const [link, setLink] = useState(_saved.link ?? '')
-  const [voiceKey, setVoiceKey] = useState('')
-  const [editMode, setEditMode] = useState(_saved.editMode ?? 'commentary')
-  const [renderModel, setRenderModel] = useState(_saved.renderModel ?? 'passthrough-trim')
-  const [voiceCloneModel, setVoiceCloneModel] = useState(_saved.voiceCloneModel ?? 'f5-tts')
+  // Shared jobs list — used to detect when the job THIS Studio created reaches a
+  // completed state, so the cover can be cleared once the video is done (not on
+  // submit). See the createdJobId + clear-on-done effect below.
+  const { jobs } = useData()
+  // Per-job creation fields are restored from the cached draft (localStorage) on
+  // mount so an in-progress draft survives navigation/refresh; they fall back to
+  // STUDIO_DEFAULTS when no draft exists, and are reset to defaults (and the cache
+  // cleared) after a successful create. `initialDraft` is read once at mount.
+  const [initialDraft] = useState<StudioDraft>(loadStudioDraft)
+  const [link, setLink] = useState<string>(initialDraft.link)
+  const [voiceKey, setVoiceKey] = useState(initialDraft.voiceKey)
+  const [editMode, setEditMode] = useState<string>(initialDraft.editMode)
+  const [renderModel, setRenderModel] = useState<string>(initialDraft.renderModel)
+  const [voiceCloneModel, setVoiceCloneModel] = useState<string>(initialDraft.voiceCloneModel)
   const renderInstalled = INSTALLED_RENDER_MODELS.has(renderModel)
   const voiceModelInstalled = VOICE_CLONE_MODELS.find((m) => m.value === voiceCloneModel)?.installed ?? true
-  const [aspect, setAspect] = useState(_saved.aspect ?? '16:9')
-  const [targetSec, setTargetSec] = useState(_saved.targetSec ?? 300)
-  const [autoDuration, setAutoDuration] = useState(_saved.autoDuration ?? true)
-  const [addCredit, setAddCredit] = useState(_saved.addCredit ?? false)
-  const [srcAudioVolume, setSrcAudioVolume] = useState(_saved.srcAudioVolume ?? 0)
+  // Script-gen LLM: the selection is an encoded "<provider>|<model>" key (llmOptionKey);
+  // `llmOptions` is the runtime list from GET /api/llm/models (null = still loading).
+  const [llmKey, setLlmKey] = useState<string>(initialDraft.llmKey)
+  const [llmOptions, setLlmOptions] = useState<LlmModelOption[] | null>(null)
+  const [aspect, setAspect] = useState<string>(initialDraft.aspect)
+  const [targetSec, setTargetSec] = useState<number>(initialDraft.targetSec)
+  const [autoDuration, setAutoDuration] = useState<boolean>(initialDraft.autoDuration)
+  const [addCredit, setAddCredit] = useState<boolean>(initialDraft.addCredit)
+  const [srcAudioVolume, setSrcAudioVolume] = useState<number>(initialDraft.srcAudioVolume)
   const [publish, setPublish] = useState(false) // opt-in auto-upload; default off = manual publish later
   // Platform picked in PlatformTierPicker, lifted up here. Auto-publish targets
   // ONLY this platform; null = no platform picked → nothing is auto-published.
   const [publishPlatform, setPublishPlatform] = useState<string | null>(null)
   const [showAddVoice, setShowAddVoice] = useState(false)
 
-  // PART B (script reuse): when a saved script is picked, the job is created with
-  // reuseScriptVideoId set and the backend SKIPS script-gen. This is intentionally
-  // NOT persisted to localStorage (see StudioSaved) — a reuse selection must reset
-  // on reload, never silently stick across sessions. `reusedScript` holds the full
-  // picked row so the summary chip + the cross-mode warning can read its metadata.
+  // PART B (script reuse): when a saved script is picked, the job skips
+  // script-gen. The selection is in-session only (not persisted across refreshes)
+  // and resets to null after a successful create. `reusedScriptEdited` likewise
+  // tracks in-session edits only.
   const [showScriptPicker, setShowScriptPicker] = useState(false)
   const [reusedScript, setReusedScript] = useState<ReusableScript | null>(null)
   const reuseScriptVideoId = reusedScript?.videoId ?? null
@@ -1231,8 +2063,15 @@ function Studio({
   //   'with-audio'  → Button 2: reuse script + let the TTS cache serve existing audio.
   // Defaults to 'fresh-audio' (the safe path) until the owner chooses.
   const [reuseMode, setReuseMode] = useState<'fresh-audio' | 'with-audio'>('fresh-audio')
-  // Edited text → stale cache regardless of reuseMode; always bypass+delete.
-  const bypassTtsCache = reuseMode === 'fresh-audio' || reusedScriptEdited
+  // A script's cached audio is STALE either because it was edited inline THIS
+  // session (reusedScriptEdited) or because the backend flagged it edited in a
+  // PREVIOUS session (reusedScript.audioStale). Both mean reusing WITH audio would
+  // serve mismatched audio, so we force a fresh re-synth + warn.
+  const audioStale = reusedScriptEdited || (reusedScript?.audioStale ?? false)
+  // Whether reusing WITH cached audio is even possible for the picked script.
+  const audioCached = reusedScript?.audioCached ?? false
+  // Edited/stale text → stale cache regardless of reuseMode; always bypass+delete.
+  const bypassTtsCache = reuseMode === 'fresh-audio' || audioStale
   // The "audio may not match" warning shows when the owner picks Button 2 on an
   // edited script; they can dismiss it to proceed anyway.
   const [audioMismatchAck, setAudioMismatchAck] = useState(false)
@@ -1257,6 +2096,49 @@ function Studio({
     }
   }, [pageId])
 
+  // Script-gen LLM options. Fetched ONCE on mount — the backend caches the list
+  // server-side (~6h), so no client-side cache here. The list is key-dependent and
+  // can legitimately contain a single entry (claude-cli alone); that is not an
+  // error state. On failure we fall back to an EMPTY list: the dropdown then shows
+  // one "backend default" row and create() omits the llm fields, so the job runs
+  // exactly as it did before this feature existed.
+  useEffect(() => {
+    let cancelled = false
+    api.getLlmModels()
+      .then((res) => {
+        if (cancelled) return
+        const opts = res.options ?? []
+        setLlmOptions(opts)
+        // Resolve the selection ONCE the real list is known: keep the draft/pinned
+        // choice when it is still offered, otherwise take whatever the API marks
+        // is_default. Never hardcode 'claude-cli' — the default is the backend's
+        // to move, and a pinned key for a provider that lost its API key must not
+        // leave the field pointing at an option that no longer exists.
+        setLlmKey((cur) => {
+          if (cur && opts.some((o) => llmOptionKey(o) === cur)) return cur
+          const def = opts.find((o) => o.is_default) ?? opts[0]
+          return def ? llmOptionKey(def) : ''
+        })
+      })
+      .catch(() => {
+        if (!cancelled) setLlmOptions([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // The selected LLM row (null while the list is loading, or when it came back empty).
+  const selectedLlm = llmOptions?.find((o) => llmOptionKey(o) === llmKey) ?? null
+  // The llm half of the create payload. EMPTY when the owner is on the backend's
+  // default option (or nothing is resolved yet): omitted keys are dropped by
+  // JSON.stringify, so a default job's body stays byte-identical to the one this
+  // form sent before the dropdown existed.
+  const llmPayload: { llmProvider?: string | null; llmModel?: string | null } =
+    selectedLlm && !selectedLlm.is_default
+      ? { llmProvider: selectedLlm.provider, llmModel: selectedLlm.model }
+      : {}
+
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [previewing, setPreviewing] = useState(false)
   const [creating, setCreating] = useState(false)
@@ -1264,12 +2146,218 @@ function Studio({
 
   // Output title for the video being created. Applied at create time; an empty
   // value falls back to the source video's title on the backend.
-  const [title, setTitle] = useState(_saved.title ?? '')
+  const [title, setTitle] = useState<string>(initialDraft.title)
 
-  // Persist form state on every change so navigating away and back restores it.
+  // Adopt a pending (held) source into the Studio input when the outer link is EMPTY
+  // and the pipeline is idle. Held rows (a saved source-list batch) can't run on their
+  // own: "Tạo video" is disabled without an outer link, so a batch saved with no outer
+  // link leaves every row stuck. Here we MOVE the oldest held row into the outer input
+  // (link + title) and DELETE it from held — so pressing "Tạo video" creates it once and
+  // releases the REST (no duplicate). Guarded so it adopts exactly one row, only while
+  // nothing is running. Delete-then-fill order: on a delete failure the input stays empty
+  // (no double-run risk) and it retries on the next jobs refresh.
+  const adoptingHeldRef = useRef(false)
   useEffect(() => {
-    saveStudioSaved({ link, title, editMode, renderModel, voiceCloneModel, aspect, targetSec, autoDuration, addCredit, srcAudioVolume })
-  }, [link, title, editMode, renderModel, voiceCloneModel, aspect, targetSec, autoDuration, addCredit, srcAudioVolume])
+    if (link.trim() || adoptingHeldRef.current) return
+    const pageJobs = jobs.filter((j) => j.pageId === pageId)
+    if (pageJobs.some((j) => j.status === 'running')) return // pipeline busy — don't touch
+    const held = pageJobs.filter((j) => j.status === 'held').sort((a, b) => a.id - b.id)
+    if (held.length === 0) return
+    const first = held[0]
+    adoptingHeldRef.current = true
+    void (async () => {
+      try {
+        await api.deleteJob(first.id)
+        setLink(first.inputPayload)
+        if (first.title) setTitle(first.title)
+        await onCreated()
+      } catch {
+        /* leave input empty; retry on the next jobs refresh */
+      } finally {
+        adoptingHeldRef.current = false
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobs, link, pageId])
+
+  // AI cover/thumbnail generation. `cover` holds the last generated cover;
+  // `coverStyleIndex` increments each click so re-clicking varies the style;
+  // `useCover` opts the cover into the job at create time. These are PERSISTED in
+  // the Studio draft (so a generated cover, the use-cover choice, the manual
+  // prompt, and the style index all survive a page refresh) and are cleared when
+  // the created job COMPLETES (see the clear-on-done effect below) — NOT on submit,
+  // so the cover stays visible while the job runs. `coverLoading`/`coverErr` are
+  // transient (not persisted).
+  const [cover, setCover] = useState<CoverResult | null>(initialDraft.cover)
+  const [coverLoading, setCoverLoading] = useState(false)
+  // Live progress percent (0..100) while a cover generates. Transient — never
+  // persisted in the draft (like coverLoading).
+  const [coverPct, setCoverPct] = useState(0)
+  // The actual assembled prompt the backend is sending to SDXL, surfaced from the
+  // progress poll and shown under the loading indicator. Transient — NOT persisted.
+  const [coverPromptShown, setCoverPromptShown] = useState('')
+  const [coverStyleIndex, setCoverStyleIndex] = useState(initialDraft.coverStyleIndex)
+  const [useCover, setUseCover] = useState(initialDraft.useCover)
+  const [coverErr, setCoverErr] = useState<string | null>(null)
+  // Optional manual base prompt for the cover. When non-empty it overrides the
+  // auto title+summary prompt on the backend (style still varies per click).
+  const [coverPrompt, setCoverPrompt] = useState(initialDraft.coverPrompt)
+  // Cover TITLE state. `coverBasePath` tracks the CLEAN (title-less) cover
+  // separately from the displayed `cover`: it is set on a FRESH generate or a
+  // saved-cover pick, but NOT when applying the title — so every renderCoverTitle
+  // call re-composites from the clean base (no stacking). `coverText` is the
+  // editable Vietnamese title (prefilled from the generate result's viTitle);
+  // `coverKeyWords` are the phrases the backend highlights. `coverTextLoading` is
+  // transient (apply-button spinner, not persisted).
+  const [coverBasePath, setCoverBasePath] = useState<string | null>(initialDraft.coverBasePath)
+  const [coverText, setCoverText] = useState(initialDraft.coverText)
+  const [coverKeyWords, setCoverKeyWords] = useState<string[]>(initialDraft.coverKeyWords)
+  // Manual title-style knobs (default Auto). Position 'auto' = auto anchor; the
+  // *Auto booleans send null for the color/font/tilt values while on.
+  const [coverPosition, setCoverPosition] = useState(initialDraft.coverPosition)
+  const [coverAlign, setCoverAlign] = useState(initialDraft.coverAlign)
+  const [coverStrokeColor, setCoverStrokeColor] = useState(initialDraft.coverStrokeColor)
+  const [coverStrokeAuto, setCoverStrokeAuto] = useState(initialDraft.coverStrokeAuto)
+  const [coverKeyColor, setCoverKeyColor] = useState(initialDraft.coverKeyColor)
+  const [coverKeyColor2, setCoverKeyColor2] = useState(initialDraft.coverKeyColor2)
+  const [coverKeyColorAuto, setCoverKeyColorAuto] = useState(initialDraft.coverKeyColorAuto)
+  const [coverGradient, setCoverGradient] = useState(initialDraft.coverGradient)
+  const [coverFontScale, setCoverFontScale] = useState(initialDraft.coverFontScale)
+  const [coverFontAuto, setCoverFontAuto] = useState(initialDraft.coverFontAuto)
+  const [coverTilt, setCoverTilt] = useState(initialDraft.coverTilt)
+  const [coverTiltAuto, setCoverTiltAuto] = useState(initialDraft.coverTiltAuto)
+  const [coverTextLoading, setCoverTextLoading] = useState(false)
+  // In-flight cover task id, persisted so the percent poll RESUMES after a refresh
+  // (see the resume effect + pollCover below). null = no active task.
+  const [coverTaskId, setCoverTaskId] = useState<string | null>(initialDraft.coverTaskId)
+  // Monotonic token that identifies the CURRENT cover-generation run. Each
+  // makeCover() bumps it; the poll loop captures its own token and bails the moment
+  // the ref no longer matches (a newer click started, or the component unmounted),
+  // so a stale poll can never overwrite a newer render. Bumped to a sentinel on
+  // unmount by the cleanup effect below.
+  const coverRunRef = useRef(0)
+  // Monotonic counter → a NEW seed on every "Áp dụng" click so the backend re-rolls
+  // a fresh title style VARIATION (position/gradient/dominant-color) each time, even
+  // when the text is unchanged. Not the SDXL render seed — just a changing integer.
+  const coverTitleSeedRef = useRef(0)
+  // Id of the job THIS Studio last created — the one whose completion should clear
+  // the cover. Persisted in the draft so the watch survives a refresh (if the job
+  // finishes after reload, the clear-on-done effect still fires). null = nothing
+  // to watch.
+  const [createdJobId, setCreatedJobId] = useState<number | null>(initialDraft.createdJobId)
+  // Guards the clear-on-done so it fires exactly ONCE per completed job and never
+  // wipes a cover the user is preparing for the NEXT video (a new create() sets a
+  // fresh createdJobId; a job id can only be cleared once).
+  const clearedCoverJobIdRef = useRef<number | null>(null)
+  // The cover PATH submitted with the currently-tracked job. Clear-on-done only
+  // wipes the editing cover if it STILL equals this snapshot — so if the owner
+  // has already started a NEW cover for the next video, completion of the old job
+  // won't wipe it. null = the tracked job had no cover, so there's nothing to
+  // reconcile (clear-on-done then leaves the editing cover untouched).
+  const submittedCoverPathRef = useRef<string | null>(null)
+
+  // Browse-created-covers picker modal (mirrors the ReusableScriptPicker pattern).
+  const [showSavedCovers, setShowSavedCovers] = useState(false)
+
+  // Batch "Add List" modal (mirrors the SavedCoverPicker pattern): paste many
+  // links, preview each link's auto-translated VN title, then create one job per
+  // link using the CURRENT Studio settings.
+  const [showBatch, setShowBatch] = useState(false)
+
+  // Reuse-guard memory (submit-time safeguard against a silent reuse reset).
+  // `reusedScript` is intentionally NOT persisted and is reset to null after every
+  // successful create, so after creating a REUSE job the form keeps the same
+  // link/voice/mode (looks identical) but the reuse selection is gone — the next
+  // submit would silently regenerate a NEW script. To catch exactly that case we
+  // remember, in a ref that is NOT cleared on create, the link of the LAST
+  // successful create that used reuse, and which script videoId it reused. When a
+  // new submit has the SAME (non-empty) link but reuse is now null, we know the
+  // owner almost certainly expected reuse and warn before regenerating. These are
+  // refs (not state) so they survive the post-create reset without being part of
+  // the draft; a truly new/different/empty link never matches, so no nagging.
+  const lastReuseLinkRef = useRef<string | null>(null)
+  const lastReuseVideoIdRef = useRef<number | null>(null)
+  // When the guard fires, this holds the videoId the last reuse used, and drives
+  // the confirmation modal. null = modal closed.
+  const [reuseGuard, setReuseGuard] = useState<{ lastVideoId: number } | null>(null)
+
+  // Persist the in-progress draft on every field change so navigating away/back or
+  // refreshing restores it. Only the per-job draft fields are cached (NOT in-session
+  // reuse/publish selections). A successful create clears this key (see create()).
+  useEffect(() => {
+    const draft: StudioDraft = {
+      link, title, editMode, renderModel, voiceCloneModel, llmKey,
+      aspect, targetSec, autoDuration, addCredit, srcAudioVolume, voiceKey,
+      cover, useCover, coverPrompt, coverStyleIndex, coverTaskId, createdJobId,
+      coverBasePath, coverText, coverKeyWords,
+      coverPosition, coverAlign, coverKeyColor, coverKeyColor2, coverKeyColorAuto, coverGradient,
+      coverStrokeColor, coverStrokeAuto,
+      coverFontScale, coverFontAuto, coverTilt, coverTiltAuto,
+    }
+    try {
+      localStorage.setItem(STUDIO_DRAFT_KEY, JSON.stringify(draft))
+    } catch {
+      /* storage unavailable (private mode/quota) — draft caching is best-effort */
+    }
+  }, [link, title, editMode, renderModel, voiceCloneModel, llmKey, aspect, targetSec, autoDuration, addCredit, srcAudioVolume, voiceKey, cover, useCover, coverPrompt, coverStyleIndex, coverTaskId, createdJobId, coverBasePath, coverText, coverKeyWords, coverPosition, coverAlign, coverKeyColor, coverKeyColor2, coverKeyColorAuto, coverGradient, coverStrokeColor, coverStrokeAuto, coverFontScale, coverFontAuto, coverTilt, coverTiltAuto])
+
+  // Clear the cover when the created job COMPLETES ('done') — not on submit — so
+  // the cover stays visible while the pipeline runs, then disappears once the
+  // video is ready. Scoped tightly so it can never wipe a cover the owner is
+  // preparing for the NEXT video:
+  //   - it only ever looks at the specific createdJobId this Studio last created
+  //     (persisted, so a mid-run refresh re-engages the watch and it still fires
+  //     when the job finishes afterwards);
+  //   - clearedCoverJobIdRef ensures it fires at most ONCE per job id;
+  //   - a new create() sets a fresh createdJobId, so the guard is per-job;
+  //   - it only clears the editing cover state if that cover is STILL the one the
+  //     job was submitted with (submittedCoverPathRef). If the owner has already
+  //     started a NEW cover for the next video (a fresh generation in flight, or a
+  //     different cover.path now), we skip the cover-state clear but still consume
+  //     the job id so it doesn't retrigger.
+  // Clearing the React state cascades into the draft-save effect above, which
+  // re-persists the now-empty cover — so it doesn't come back on the next refresh.
+  useEffect(() => {
+    if (createdJobId == null) return
+    if (clearedCoverJobIdRef.current === createdJobId) return
+    const j = jobs.find((x) => x.id === createdJobId)
+    if (j?.status === 'done') {
+      clearedCoverJobIdRef.current = createdJobId
+      // Only clear the editing cover if it's untouched since submit: the current
+      // cover still matches the submitted path, and no new cover is being made.
+      const coverUnchanged =
+        !coverLoading &&
+        (cover?.path ?? null) === submittedCoverPathRef.current
+      if (coverUnchanged) {
+        setCover(null)
+        setUseCover(false)
+        setCoverPrompt('')
+        setCoverStyleIndex(0)
+        setCoverErr(null)
+        setCoverPct(0)
+        setCoverTaskId(null)
+        // Cover cleared → also clear its title base + editable title + keywords,
+        // and reset the manual title-style knobs back to Auto.
+        setCoverBasePath(null)
+        setCoverText('')
+        setCoverKeyWords([])
+        setCoverPosition(STUDIO_DEFAULTS.coverPosition)
+        setCoverAlign(STUDIO_DEFAULTS.coverAlign)
+        setCoverStrokeColor(STUDIO_DEFAULTS.coverStrokeColor)
+        setCoverStrokeAuto(STUDIO_DEFAULTS.coverStrokeAuto)
+        setCoverKeyColor(STUDIO_DEFAULTS.coverKeyColor)
+        setCoverKeyColor2(STUDIO_DEFAULTS.coverKeyColor2)
+        setCoverKeyColorAuto(STUDIO_DEFAULTS.coverKeyColorAuto)
+        setCoverGradient(STUDIO_DEFAULTS.coverGradient)
+        setCoverFontScale(STUDIO_DEFAULTS.coverFontScale)
+        setCoverFontAuto(STUDIO_DEFAULTS.coverFontAuto)
+        setCoverTilt(STUDIO_DEFAULTS.coverTilt)
+        setCoverTiltAuto(STUDIO_DEFAULTS.coverTiltAuto)
+      }
+      submittedCoverPathRef.current = null
+      setCreatedJobId(null)
+    }
+  }, [jobs, createdJobId, cover, coverLoading])
 
   // Source link metadata (title/duration/thumbnail/handle) for the preview box.
   const [probe, setProbe] = useState<Awaited<ReturnType<typeof api.probeLink>> | null>(null)
@@ -1302,8 +2390,40 @@ function Studio({
   // Build the voice dropdown (cloned voices only; presets are no longer offered).
   const voiceOptions = useMemo(() => buildVoiceOptions(voices), [voices])
 
+  // Initial voice selection. Mirrors the shared Select's "pinned default wins over a
+  // draft-restored value" semantics — a PINNED voice (present in localStorage AND still
+  // in the loaded list) is applied on the first load EVEN IF a draft restored a
+  // different voiceKey. Runs against the async-loaded voiceOptions.
+  //  - firstLoad (voiceInitRef): the one-time pass where the pinned default overrides a
+  //    draft-restored voiceKey. Guarded by the ref so a later voices refetch (add/delete)
+  //    can never clobber a manual selection.
+  //  - empty voiceKey (any time: fresh form OR the post-create reset that clears it):
+  //    fill it — prefer the pinned default when valid, else the first option.
+  //  - stale/deleted pinned voice: `match` is undefined → keep the draft value, or fall
+  //    back to the first option when empty (picker is never left empty).
+  const voiceInitRef = useRef(false)
   useEffect(() => {
-    if (!voiceKey && voiceOptions.length) setVoiceKey(voiceOptions[0].key)
+    if (!voiceOptions.length) return
+    const firstLoad = !voiceInitRef.current
+    voiceInitRef.current = true
+
+    const pinned = getDefaultPref(VOICE_DEFAULT_SETTING_KEY)
+    const match = pinned ? voiceOptions.find((o) => o.key === pinned) : undefined
+
+    let pick: VoiceOption | undefined
+    if (match && (firstLoad || !voiceKey)) pick = match
+    else if (!voiceKey) pick = voiceOptions[0]
+    if (!pick) return
+
+    if (pick.key !== voiceKey) setVoiceKey(pick.key)
+    // Engine coherence: when we auto-select the PINNED voice, make the voice-clone
+    // engine follow it so the chosen clone is synth-able by the engine. The pinned
+    // VOICE takes precedence over a pinned ENGINE default here.
+    if (pick === match) {
+      const engine = VOICE_CLONE_MODELS.find((m) => m.short === match.model)?.value
+      if (engine && engine !== voiceCloneModel) setVoiceCloneModel(engine)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [voiceOptions, voiceKey])
 
   const selected = voiceOptions.find((o) => o.key === voiceKey)
@@ -1358,19 +2478,386 @@ function Studio({
     }
   }
 
-  const create = async () => {
-    if (!link.trim()) {
+  // The title used for cover generation: the SOURCE video's probed title (owner:
+  // the cover should reflect the source, NOT the manually-typed Studio title field).
+  // Empty (no link / probe pending) → the auto path is unavailable, but a manual
+  // prompt still enables the button (the backend only needs title on the auto path).
+  const coverTitle = (probe?.title?.trim() || '')
+
+  // Generate (or regenerate) the AI cover. Each click bumps coverStyleIndex and
+  // passes seed=null so the backend varies the style — re-clicking gives a
+  // different look. A manual `coverPrompt` (when set) overrides the auto prompt;
+  // otherwise the TITLE alone drives it (owner: cover prompt uses the title only,
+  // NOT the script/content summary).
+  //
+  // The backend flow is ASYNC: POST returns { taskId } immediately; we then poll
+  // GET /generate/cover/progress/{taskId} every ~500ms until 'done' (store result)
+  // or 'error'. Overlap/stale guard: each run captures its own `token` from
+  // coverRunRef; the loop bails whenever coverRunRef.current !== token (a newer
+  // click, or unmount), so a stale poll can never clobber a newer render's state.
+  // A ~180s safety timeout stops a runaway poll and surfaces an error.
+  // Shared poll loop for a cover-generation task. Used by BOTH makeCover (fresh
+  // click) and the resume effect (a taskId restored from the draft after refresh).
+  // `token` is captured from coverRunRef by the caller; the loop bails whenever
+  // coverRunRef.current !== token (a newer click superseded this run, or the
+  // component unmounted → ref set to -1), so a stale poll can never overwrite a
+  // newer render's state. `resumed` only tweaks copy on the timeout/network paths.
+  //   done   → store result (if any), 100%, stop, clear task id.
+  //   error  → surface backend error, stop, clear task id.
+  //   404    → task expired/GC'd or server restarted: stop QUIETLY (keep any
+  //            already-persisted cover image), no scary error, clear task id.
+  //   other transient fetch errors → keep retrying until the safety timeout.
+  const pollCover = async (taskId: string, token: number) => {
+    const isStale = () => coverRunRef.current !== token
+    const POLL_MS = 500
+    const TIMEOUT_MS = 180_000
+    const startedAt = Date.now()
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      if (isStale()) return
+      if (Date.now() - startedAt > TIMEOUT_MS) {
+        if (isStale()) return
+        setCoverErr('Tạo cover quá lâu — đã hết thời gian chờ.')
+        setCoverLoading(false)
+        setCoverPromptShown('')
+        setCoverTaskId(null)
+        toastError('Tạo cover quá lâu')
+        return
+      }
+      let prog: Awaited<ReturnType<typeof api.getCoverProgress>>
+      try {
+        prog = await api.getCoverProgress(taskId)
+      } catch (e) {
+        // A 404 means the task is gone (expired past the backend's ~600s window,
+        // GC'd, or the server restarted). Stop QUIETLY — keep any cover already
+        // shown; do NOT surface an error. Any other error is treated as a
+        // transient network blip and retried until the safety timeout.
+        if (e instanceof ApiError && e.status === 404) {
+          if (isStale()) return
+          setCoverLoading(false)
+          setCoverPromptShown('')
+          setCoverTaskId(null)
+          return
+        }
+        await sleep(POLL_MS)
+        continue
+      }
+      if (isStale()) return
+      // Surface the assembled prompt as soon as the backend reports it (on any
+      // running/done tick). Also fill it into the EDITABLE prompt textarea so the
+      // owner can tweak the vision-crafted prompt and re-click to reuse/edit it.
+      if (prog.prompt && prog.prompt.trim()) {
+        setCoverPromptShown(prog.prompt)
+        setCoverPrompt(prog.prompt)
+      }
+      if (prog.status === 'done') {
+        if (prog.result) {
+          setCover(prog.result)
+          // A successfully generated cover is opted into the job automatically —
+          // the owner asked for one, so "Sử dụng ảnh Cover" turns itself on. They
+          // can still untoggle it (or clear the cover) before creating the video.
+          setUseCover(true)
+          // Fresh clean cover → its `basePath` becomes the title compositing base.
+          // The displayed cover stays this clean image until the owner edits the
+          // auto-translated title (viTitle) and clicks "Áp dụng". Prefill the
+          // editable title + the keywords the backend will highlight.
+          // `||` (not `??`) so an EMPTY-STRING basePath (title-only/non-vision covers
+          // return basePath="") falls back to the rendered path — otherwise the base
+          // stays "" and the "Áp dụng" button never enables.
+          setCoverBasePath(prog.result.basePath || prog.result.path)
+          setCoverText(prog.result.viTitle ?? '')
+          setCoverKeyWords(prog.result.keyWords ?? [])
+        }
+        setCoverPct(100)
+        setCoverLoading(false)
+        setCoverPromptShown('')
+        setCoverTaskId(null)
+        return
+      }
+      if (prog.status === 'error') {
+        setCoverErr(prog.error ?? 'Tạo cover thất bại.')
+        setCoverLoading(false)
+        setCoverPromptShown('')
+        setCoverTaskId(null)
+        toastError('Tạo cover thất bại')
+        return
+      }
+      // running
+      setCoverPct(Math.max(0, Math.min(100, prog.pct)))
+      await sleep(POLL_MS)
+    }
+  }
+
+  const makeCover = async () => {
+    const manual = coverPrompt.trim()
+    // The button is disabled unless there's either a title (auto path) or a
+    // manual prompt; guard defensively.
+    if (!coverTitle && !manual) return
+    const nextStyle = coverStyleIndex + 1
+    setCoverStyleIndex(nextStyle)
+    setCoverLoading(true)
+    setCoverPct(0)
+    setCoverErr(null)
+    setCoverPromptShown('')
+    // Clear the title editor for the NEW cover — it will be re-prefilled from the
+    // fresh cover's viTitle when the render completes.
+    setCoverText('')
+    setCoverKeyWords([])
+    setCoverBasePath(null)
+
+    // New run token — invalidates any in-flight poll from a previous click/resume.
+    const token = ++coverRunRef.current
+    const isStale = () => coverRunRef.current !== token
+
+    try {
+      const { taskId } = await api.generateCover({
+        page: pageName,
+        title: coverTitle,
+        aspect,
+        seed: null,
+        styleIndex: nextStyle,
+        prompt: manual || undefined,
+        // Pass the source video link (when present) so the backend can
+        // vision-analyze the source thumbnail to craft the cover prompt. Omitted
+        // when empty → title-only behavior unchanged.
+        sourceLink: link.trim() || undefined,
+        // Pin the auto-baked title's tilt to the current slider value (default 0 /
+        // flat) so a fresh "Tạo Cover" never lands on the backend's seeded random
+        // tilt unless the owner manually turned coverTiltAuto on or moved the slider.
+        tiltDeg: coverTiltAuto ? null : coverTilt,
+      })
+      if (isStale()) return
+      // Persist the task id so the poll resumes across a refresh.
+      setCoverTaskId(taskId)
+      await pollCover(taskId, token)
+    } catch (e) {
+      if (isStale()) return
+      setCoverErr(e instanceof Error ? e.message : String(e))
+      setCoverLoading(false)
+      setCoverPromptShown('')
+      setCoverTaskId(null)
+      toastError('Tạo cover thất bại')
+    }
+  }
+
+  // Apply (or re-apply) the (edited) Vietnamese title onto the CLEAN base cover. The
+  // backend always composites from `coverBasePath` and owns ALL styling (position,
+  // color, gradient, plates) — the FE only sends the title text + the keywords to
+  // highlight. So editing the title + clicking again re-renders from the clean base,
+  // never stacking. The returned CoverResult becomes the displayed `cover` (so the
+  // preview + useCover use the titled version); `coverBasePath` stays untouched.
+  const applyCoverText = async () => {
+    // Trim only the leading/trailing whitespace — internal "\n"s are preserved so
+    // the owner's typed line breaks reach the backend as hard line breaks.
+    const text = coverText.trim()
+    // Base = the clean title-less image when known, else the currently displayed
+    // cover's path (e.g. a browsed cover). Bail only when there is no base at all.
+    const base = coverBasePath || cover?.path
+    if (coverTextLoading || !text || !base) return
+    setCoverTextLoading(true)
+    // Fresh seed per click → a different style variation each apply (so knobs left
+    // on Auto still re-roll every time).
+    const seed = ++coverTitleSeedRef.current
+    try {
+      const result = await api.renderCoverTitle({
+        page: pageName,
+        basePath: base,
+        text,
+        keyWords: coverKeyWords,
+        seed,
+        // Manual overrides — send "auto"/null for any knob left on Auto so the
+        // backend does its seeded/auto thing for that dimension.
+        position: coverPosition,
+        keyColor: coverKeyColorAuto ? null : coverKeyColor,
+        // Gradient END color: only meaningful when a manual key color + gradient
+        // are both on; otherwise null (auto, or gradient off → single color).
+        keyColor2: (coverKeyColorAuto || !coverGradient) ? null : coverKeyColor2,
+        gradient: coverGradient,
+        // Text BORDER color + alignment. null/"auto" -> backend auto behavior.
+        strokeColor: coverStrokeAuto ? null : coverStrokeColor,
+        align: coverAlign,
+        fontScale: coverFontAuto ? null : coverFontScale,
+        tiltDeg: coverTiltAuto ? null : coverTilt,
+      })
+      setCover(result)
+      success('Đã áp dụng tiêu đề lên cover')
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : 'Áp dụng tiêu đề thất bại')
+    } finally {
+      setCoverTextLoading(false)
+    }
+  }
+
+  // Resume the percent poll on mount if a task id was restored from the draft
+  // (the user refreshed while a cover was still generating). Runs ONCE; captures a
+  // fresh run token so a later manual click supersedes it. A 404 inside pollCover
+  // (task expired/gone) stops quietly and leaves any already-shown cover intact.
+  useEffect(() => {
+    if (!coverTaskId) return
+    const token = ++coverRunRef.current
+    setCoverLoading(true)
+    setCoverErr(null)
+    void pollCover(coverTaskId, token)
+    // Mount-only: intentionally not re-run when coverTaskId changes later (fresh
+    // clicks are driven by makeCover, not this effect).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // On unmount, invalidate any in-flight cover poll so it stops touching state.
+  useEffect(() => {
+    return () => { coverRunRef.current = -1 }
+  }, [])
+
+  // `bypassGuard` skips the reuse-regenerate confirmation (used by the modal's
+  // "Sinh kịch bản mới" action to proceed after the owner has acknowledged it).
+  const create = async (bypassGuard = false) => {
+    const trimmedLink = link.trim()
+    if (!trimmedLink) {
       setMsg({ kind: 'err', text: 'Dán link nguồn trước đã.' })
+      return
+    }
+    // Safety guard (mirrors the disabled button): never submit while a cover is
+    // still generating — otherwise the cover the owner intends may not yet be
+    // captured, and the job would be created with no cover.
+    if (coverLoading) {
+      setMsg({ kind: 'err', text: 'Đang tạo cover — chờ xong rồi tạo video.' })
+      return
+    }
+    // Reuse guard: the previous successful create for THIS exact link reused a
+    // script, but reuse is now null (it silently reset after that create and the
+    // form still looks identical). Warn before regenerating a brand-new script.
+    // Only fires when the link matches the remembered reuse link — a new/different/
+    // empty link never matches, so genuinely fresh videos are never prompted.
+    if (
+      !bypassGuard &&
+      reuseScriptVideoId == null &&
+      lastReuseVideoIdRef.current != null &&
+      lastReuseLinkRef.current === trimmedLink
+    ) {
+      setReuseGuard({ lastVideoId: lastReuseVideoIdRef.current })
       return
     }
     setCreating(true)
     setMsg(null)
     try {
-      await api.createJob({ pageId, link: link.trim(), title: title.trim() || undefined, voice: voiceKey || null, editMode, renderModel, voiceCloneModel, aspect, targetSec: autoDuration ? null : targetSec, addCredit, srcAudioVolume, publish, publishPlatform: publish ? publishPlatform : null, reuseScriptVideoId: reuseScriptVideoId ?? null, bypassTtsCache: reuseScriptVideoId != null ? bypassTtsCache : undefined })
+      // Snapshot the cover for THIS submission into a local const, so nothing the
+      // owner does afterwards (e.g. generating a new cover for the next video)
+      // can change what this job was created with. The backend stores the path
+      // immutably; this just guarantees the value we send is a stable snapshot.
+      const submittedCover = cover
+      const useCoverNow = useCover && !!submittedCover
+      const created = await api.createJob({ pageId, link: link.trim(), title: title.trim() || undefined, voice: voiceKey || null, editMode, renderModel, voiceCloneModel, ...llmPayload, aspect, targetSec: autoDuration ? null : targetSec, addCredit, srcAudioVolume, publish, publishPlatform: publish ? publishPlatform : null, reuseScriptVideoId: reuseScriptVideoId ?? null, bypassTtsCache: reuseScriptVideoId != null ? bypassTtsCache : undefined, bypassScriptCache: true, useCover: useCoverNow || undefined, coverImagePath: useCoverNow ? submittedCover!.path : undefined })
+      // The cover for THIS job is already snapshotted (submittedCover) and sent to
+      // the backend above, so the editing cover state is now safe to clear — the
+      // owner wants a clean cover state for the NEXT video the moment they hit
+      // "Tạo video", not a leftover preview from the last create. The actual reset
+      // happens in the post-create field reset below (alongside the other per-job
+      // fields). No clear-on-done watch is needed anymore; neutralize its trackers
+      // so the (now defunct) done-effect can't fire against a stale/new cover.
+      submittedCoverPathRef.current = null
+      clearedCoverJobIdRef.current = null
+      // Remember whether THIS create reused a script, keyed by the exact link, so
+      // the next submit can detect a silent reuse reset (see the guard above).
+      // Refs so they survive the post-create field reset without joining the draft.
+      // If this create did NOT reuse, clear the memory so a later same-link regen
+      // isn't wrongly flagged.
+      if (reuseScriptVideoId != null) {
+        lastReuseLinkRef.current = link.trim()
+        lastReuseVideoIdRef.current = reuseScriptVideoId
+      } else {
+        lastReuseLinkRef.current = null
+        lastReuseVideoIdRef.current = null
+      }
+      setCreatedJobId(created.id)
       await onCreated()
+      // Flush the page's SAVED source-list rows (status 'held') into the queue so
+      // they run behind this freshly-created job. Non-fatal: a release failure must
+      // NOT break the main create success path — surface a soft toast and move on.
+      try {
+        const rel = await api.releaseJobs(pageId)
+        if (rel.released > 0) {
+          success(`Đã đưa ${rel.released} nguồn đã lưu vào hàng đợi`)
+          await onCreated()
+        }
+      } catch (relErr) {
+        toastError(`Không thể chạy các nguồn đã lưu: ${relErr instanceof Error ? relErr.message : String(relErr)}`)
+      }
       setMsg({ kind: 'ok', text: 'Đã thêm vào hàng đợi. Pipeline sẽ tự xử lý.' })
-      setLink('')
-      setTitle('')
+      // Reset the per-job creation fields back to defaults after a successful
+      // create, so the form is ready for the next video instead of carrying over
+      // the last-used selection. Also wipe the cached draft so a later refresh
+      // starts clean (the persist-on-change effect re-saves the defaults next tick).
+      try {
+        localStorage.removeItem(STUDIO_DRAFT_KEY)
+      } catch {
+        /* storage unavailable — nothing to clear */
+      }
+      setLink(STUDIO_DEFAULTS.link)
+      setTitle(STUDIO_DEFAULTS.title)
+      setEditMode(STUDIO_DEFAULTS.editMode)
+      setRenderModel(STUDIO_DEFAULTS.renderModel)
+      setVoiceCloneModel(STUDIO_DEFAULTS.voiceCloneModel)
+      // Script-gen LLM: back to the owner's ★-pinned default when it is still on
+      // offer, else the backend's is_default row. Resolved here instead of blanking
+      // to STUDIO_DEFAULTS.llmKey ('') because the options fetch is mount-only and
+      // would not re-resolve an empty key after this reset.
+      {
+        const pinnedLlmKey = getDefaultPref(LLM_SETTING_KEY)
+        const fallbackLlm = llmOptions?.find((o) => o.is_default) ?? llmOptions?.[0]
+        setLlmKey(
+          pinnedLlmKey && llmOptions?.some((o) => llmOptionKey(o) === pinnedLlmKey)
+            ? pinnedLlmKey
+            : fallbackLlm
+              ? llmOptionKey(fallbackLlm)
+              : STUDIO_DEFAULTS.llmKey,
+        )
+      }
+      setAspect(STUDIO_DEFAULTS.aspect)
+      setTargetSec(STUDIO_DEFAULTS.targetSec)
+      setAutoDuration(STUDIO_DEFAULTS.autoDuration)
+      setAddCredit(STUDIO_DEFAULTS.addCredit)
+      setSrcAudioVolume(STUDIO_DEFAULTS.srcAudioVolume)
+      setVoiceKey('')
+      setReusedScript(null)
+      setReusedScriptEdited(false)
+      setReuseMode('fresh-audio')
+      setAudioMismatchAck(false)
+      setPublish(false)
+      setPublishPlatform(null)
+      setProbe(null)
+      setPreviewUrl(null)
+      // Clear the cover state NOW that the job is queued — the owner wants each
+      // new "Tạo video" to start from a clean cover (no leftover preview from the
+      // last video). Safe because the submitted cover was already snapshotted and
+      // sent to the backend above. Invalidate any in-flight cover poll first so it
+      // can't write back onto the freshly-cleared state.
+      coverRunRef.current = -1
+      setCover(null)
+      setUseCover(false)
+      setCoverPrompt('')
+      setCoverStyleIndex(STUDIO_DEFAULTS.coverStyleIndex)
+      setCoverErr(null)
+      setCoverPct(0)
+      setCoverTaskId(null)
+      setCoverPromptShown('')
+      // Reset the title base + editable title + keywords + manual knobs (→ Auto)
+      // for the next video.
+      setCoverBasePath(null)
+      setCoverText('')
+      setCoverKeyWords([])
+      setCoverPosition(STUDIO_DEFAULTS.coverPosition)
+      setCoverAlign(STUDIO_DEFAULTS.coverAlign)
+      setCoverStrokeColor(STUDIO_DEFAULTS.coverStrokeColor)
+      setCoverStrokeAuto(STUDIO_DEFAULTS.coverStrokeAuto)
+      setCoverKeyColor(STUDIO_DEFAULTS.coverKeyColor)
+      setCoverKeyColor2(STUDIO_DEFAULTS.coverKeyColor2)
+      setCoverKeyColorAuto(STUDIO_DEFAULTS.coverKeyColorAuto)
+      setCoverGradient(STUDIO_DEFAULTS.coverGradient)
+      setCoverFontScale(STUDIO_DEFAULTS.coverFontScale)
+      setCoverFontAuto(STUDIO_DEFAULTS.coverFontAuto)
+      setCoverTilt(STUDIO_DEFAULTS.coverTilt)
+      setCoverTiltAuto(STUDIO_DEFAULTS.coverTiltAuto)
       success('Đã thêm job vào hàng đợi')
     } catch (e) {
       setMsg({ kind: 'err', text: e instanceof Error ? e.message : String(e) })
@@ -1424,7 +2911,12 @@ function Studio({
             ) : (
               <div className="space-y-2">
                 <div className="flex items-start justify-between gap-2 rounded-lg border border-brand/40 bg-brand/10 px-3 py-2">
-                  <div className="min-w-0 flex-1">
+                  <button
+                    type="button"
+                    onClick={() => setShowScriptPicker(true)}
+                    className="min-w-0 flex-1 text-left"
+                    title="Click để đổi kịch bản"
+                  >
                     <p className="flex items-center gap-1.5 text-sm font-medium text-brand">
                       <RotateCcw className="h-4 w-4 shrink-0" />
                       <span className="truncate">
@@ -1432,11 +2924,12 @@ function Studio({
                       </span>
                     </p>
                     <p className="mt-0.5 text-[11px] text-muted">
-                      {reusedScript.sceneCount} cảnh
+                      {/* Dubbed scripts have sceneCount 0 — show the mode, not "0 cảnh". */}
+                      {reusedScript.editMode === 'dubbed' ? 'Lồng tiếng (phụ đề)' : `${reusedScript.sceneCount} cảnh`}
                       {reusedScript.renderMode ? ` · ${SCRIPT_MODE_LABEL[reusedScript.renderMode] ?? reusedScript.renderMode}` : ''}
                       {' '}· pipeline sẽ bỏ qua bước viết kịch bản.
                     </p>
-                  </div>
+                  </button>
                   <button
                     type="button"
                     onClick={() => { setReusedScript(null); setReusedScriptEdited(false); setReuseMode('fresh-audio'); setAudioMismatchAck(false) }}
@@ -1465,7 +2958,7 @@ function Studio({
                 <div className="flex flex-col gap-1.5 sm:flex-row">
                   <button
                     type="button"
-                    onClick={() => { setReuseMode('fresh-audio'); setAudioMismatchAck(false) }}
+                    onClick={() => { setReuseMode('fresh-audio'); setAudioMismatchAck(false); }}
                     className={`flex-1 rounded-lg border px-3 py-2 text-left text-xs transition ${
                       reuseMode === 'fresh-audio'
                         ? 'border-brand/60 bg-brand/10 text-fg'
@@ -1477,21 +2970,25 @@ function Studio({
                       Dùng lại kịch bản
                     </span>
                     <span className="mt-0.5 block text-[10px] leading-relaxed text-muted">
-                      Dùng lại nội dung kịch bản, tạo lại giọng đọc mới (bỏ qua cache audio).
+                      Dùng lại nội dung kịch bản, tạo lại giọng đọc mới (xóa cache audio cũ).
                     </span>
                   </button>
                   <button
                     type="button"
-                    onClick={() => setReuseMode('with-audio')}
+                    disabled={!audioCached}
+                    onClick={() => { if (audioCached) setReuseMode('with-audio') }}
                     className={`flex-1 rounded-lg border px-3 py-2 text-left text-xs transition ${
-                      reuseMode === 'with-audio'
-                        ? 'border-brand/60 bg-brand/10 text-fg'
-                        : 'border-line bg-panel2 text-muted hover:border-brand/40 hover:text-fg'
+                      !audioCached
+                        ? 'cursor-not-allowed border-line bg-panel2 text-muted opacity-50'
+                        : reuseMode === 'with-audio'
+                          ? 'border-brand/60 bg-brand/10 text-fg'
+                          : 'border-line bg-panel2 text-muted hover:border-brand/40 hover:text-fg'
                     }`}
                   >
                     <span className="flex items-center gap-1.5 font-medium">
-                      {reuseMode === 'with-audio' && <Check className="h-3.5 w-3.5 text-brand" />}
+                      {audioCached && reuseMode === 'with-audio' && <Check className="h-3.5 w-3.5 text-brand" />}
                       Dùng lại kịch bản và audio
+                      {!audioCached && <span className="font-normal text-muted">(không có cache audio)</span>}
                     </span>
                     <span className="mt-0.5 block text-[10px] leading-relaxed text-muted">
                       Dùng lại giọng đọc đã lưu (cache audio — nhanh, không chạy GPU). Nếu kịch bản đã sửa, audio vẫn tạo lại.
@@ -1499,10 +2996,11 @@ function Studio({
                   </button>
                 </div>
 
-                {/* Audio-mismatch warning: only when reusing WITH audio on a script
-                    that was edited this session. Dismissible (proceed anyway), or
-                    switch back to fresh audio (Button 1). */}
-                {reusedScriptEdited && (
+                {/* Audio-mismatch warning: when the picked script's cached audio is
+                    stale — either edited inline this session, or flagged edited in a
+                    previous session (audioStale). The old cache is cleared and audio
+                    re-synthesized automatically. */}
+                {audioStale && (
                   <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-700 dark:text-amber-200">
                     Kịch bản đã sửa — cache audio cũ sẽ bị xóa, audio mới sẽ được tạo lại tự động.
                   </div>
@@ -1511,9 +3009,38 @@ function Studio({
             )}
           </Field>
 
+          {/* Script-gen LLM. Options are fetched at runtime (they depend on which
+              provider keys the backend holds), so the list can be a single row —
+              that is a valid state, not a broken dropdown. Options flagged
+              reliability:'low' get a "— thử nghiệm" suffix plus a warning box under
+              the field, so a free-tier model is never picked unknowingly. */}
+          <Field
+            label="Model AI viết kịch bản"
+            hint={selectedLlm?.notes ?? 'Model sinh kịch bản cho video. Mặc định dùng Claude (gói thuê bao).'}
+          >
+            <Select value={llmKey} onChange={setLlmKey} settingKey={LLM_SETTING_KEY} autoApplyDefault>
+              {llmOptions == null ? (
+                <option value={llmKey}>Đang tải…</option>
+              ) : llmOptions.length === 0 ? (
+                <option value="">Mặc định của hệ thống</option>
+              ) : (
+                llmOptions.map((o) => (
+                  <option key={llmOptionKey(o)} value={llmOptionKey(o)}>
+                    {o.label}{o.reliability === 'low' ? ' — thử nghiệm' : ''}
+                  </option>
+                ))
+              )}
+            </Select>
+            {selectedLlm?.reliability === 'low' && (
+              <div className="mt-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed text-amber-700 dark:text-amber-200">
+                Model thử nghiệm (free-tier) — hay viết không xong kịch bản trong giới hạn cho phép và làm job lỗi. Chỉ dùng khi Claude không dùng được.
+              </div>
+            )}
+          </Field>
+
           <Field label="Giọng đọc" hint="Chỉ hiển thị các giọng bạn đã clone cho trang này. Bấm + để clone giọng mới.">
             <div className="flex items-center gap-2">
-              <VoicePicker value={voiceKey} onChange={setVoiceKey} voices={voices} page={pageName} onDeleted={onVoicesChanged} className="flex-1" />
+              <VoicePicker value={voiceKey} onChange={setVoiceKey} voices={voices} page={pageName} onDeleted={onVoicesChanged} className="flex-1" settingKey={VOICE_DEFAULT_SETTING_KEY} />
               <Button variant="outline" onClick={playPreview} disabled={previewing || !selected} className="shrink-0">
                 {previewing || (!!voiceKey && !selected) ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
                 Nghe thử
@@ -1531,21 +3058,19 @@ function Studio({
           <div className="grid gap-4 sm:grid-cols-2">
             <Field
               label="Cách biên tập"
-              hint={reusedScript ? 'Không áp dụng khi dùng lại kịch bản đã lưu — kịch bản đã cố định.' : EDIT_MODES.find((m) => m.value === editMode)?.desc}
+              hint={EDIT_MODES.find((m) => m.value === editMode)?.desc}
             >
-              <div className={reusedScript ? 'pointer-events-none opacity-40' : ''}>
-                <Select value={editMode} onChange={setEditMode}>
-                  {EDIT_MODES.map((m) => (
-                    <option key={m.value} value={m.value}>
-                      {m.label}
-                    </option>
-                  ))}
-                </Select>
-              </div>
+              <Select value={editMode} onChange={setEditMode} settingKey="studio.editMode" autoApplyDefault>
+                {EDIT_MODES.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
+              </Select>
             </Field>
 
             <Field label="Model dựng (engine)" hint={RENDER_MODELS.find((m) => m.value === renderModel)?.desc}>
-              <Select value={renderModel} onChange={setRenderModel}>
+              <Select value={renderModel} onChange={setRenderModel} settingKey="studio.renderModel" autoApplyDefault>
                 {Array.from(new Set(RENDER_MODELS.map((m) => m.group))).map((g) => (
                   <optgroup key={g} label={g}>
                     {RENDER_MODELS.filter((m) => m.group === g).map((m) => (
@@ -1561,7 +3086,7 @@ function Studio({
 
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="Tỷ lệ khung hình">
-              <Select value={aspect} onChange={setAspect}>
+              <Select value={aspect} onChange={setAspect} settingKey="studio.aspect" autoApplyDefault>
                 {ASPECT_OPTIONS.map((a) => (
                   <option key={a.value} value={a.value}>
                     {a.label}
@@ -1571,7 +3096,7 @@ function Studio({
             </Field>
 
             <Field label="Model lồng tiếng" hint={VOICE_CLONE_MODELS.find((m) => m.value === voiceCloneModel)?.desc}>
-              <Select value={voiceCloneModel} onChange={setVoiceCloneModel}>
+              <Select value={voiceCloneModel} onChange={setVoiceCloneModel} settingKey="studio.voiceCloneModel" autoApplyDefault>
                 {VOICE_CLONE_MODELS.map((m) => (
                   <option key={m.value} value={m.value}>
                     {m.label}
@@ -1581,139 +3106,517 @@ function Studio({
             </Field>
           </div>
 
+          {/* Row 1: LEFT column stacks "Audio gốc" + "Độ dài video đích" so its
+              combined height matches the tall cover-controls column on the RIGHT,
+              avoiding the empty void that appeared when a lone short field sat next
+              to the taller cover column. The prompt input's w-full is naturally
+              narrowed by the grid cell so it aligns evenly. The Tạo Cover button is
+              enabled when there is a usable title OR a manual prompt (the backend
+              only requires a title on the auto path). Single column on mobile via
+              sm:grid-cols-2. */}
           <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Audio gốc" hint="Mặc định tắt audio gốc; chọn % nếu muốn giữ nhẹ tiếng nền của video nguồn.">
-              <Select value={String(srcAudioVolume)} onChange={(v) => setSrcAudioVolume(Number(v))}>
-                {SRC_AUDIO_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
-                ))}
-              </Select>
-            </Field>
+            <div className="flex min-w-0 flex-col gap-4">
+              <Field label="Audio gốc" hint="Mặc định tắt audio gốc; chọn % nếu muốn giữ nhẹ tiếng nền của video nguồn.">
+                <Select value={String(srcAudioVolume)} onChange={(v) => setSrcAudioVolume(Number(v))} settingKey="studio.srcAudioVolume" autoApplyDefault>
+                  {SRC_AUDIO_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
 
-            <Field
-              label={
-                autoDuration
-                  ? 'Độ dài video đích — Tự động'
-                  : `Độ dài video đích — ${Math.floor(targetSec / 60)}:${String(targetSec % 60).padStart(2, '0')}`
-              }
-              hint={
-                reusedScript
-                  ? 'Không áp dụng khi dùng lại kịch bản đã lưu — độ dài theo kịch bản đã cố định.'
-                  : autoDuration
-                    ? 'Độ dài theo video gốc; nếu là chế độ Tóm tắt sẽ cắt bớt phần thừa.'
-                    : 'Cô đọng nguồn vào độ dài này; chỉnh phút và giây (từ 1 giây đến 50 phút).'
-              }
-            >
-              <div className={`flex h-9 items-center gap-2 ${autoDuration || reusedScript ? 'pointer-events-none opacity-40' : ''}`}>
-                <input
-                  type="number"
-                  min={0}
-                  max={50}
-                  step={1}
-                  value={Math.floor(targetSec / 60)}
-                  onChange={(e) => {
-                    // Recombine minutes + current seconds, clamp to 1s..50min.
-                    const mins = Number.isFinite(e.target.valueAsNumber) ? Math.max(0, Math.floor(e.target.valueAsNumber)) : 0
-                    const secs = targetSec % 60
-                    setTargetSec(Math.min(MAX_TARGET_SEC, Math.max(MIN_TARGET_SEC, mins * 60 + secs)))
-                  }}
-                  disabled={autoDuration || !!reusedScript}
-                  className="h-9 w-16 rounded-lg border border-line bg-panel px-2 text-sm text-fg outline-none transition focus:border-brand/50 focus:ring-2 focus:ring-brand/20 disabled:cursor-not-allowed"
-                  aria-label="Độ dài video đích (phút)"
-                />
-                <span className="shrink-0 text-[11px] text-muted">phút</span>
-                <input
-                  type="number"
-                  min={0}
-                  max={59}
-                  step={1}
-                  value={targetSec % 60}
-                  onChange={(e) => {
-                    // Recombine current minutes + seconds, clamp to 1s..50min.
-                    const mins = Math.floor(targetSec / 60)
-                    const secs = Number.isFinite(e.target.valueAsNumber) ? Math.min(59, Math.max(0, Math.floor(e.target.valueAsNumber))) : 0
-                    setTargetSec(Math.min(MAX_TARGET_SEC, Math.max(MIN_TARGET_SEC, mins * 60 + secs)))
-                  }}
-                  disabled={autoDuration || !!reusedScript}
-                  className="h-9 w-16 rounded-lg border border-line bg-panel px-2 text-sm text-fg outline-none transition focus:border-brand/50 focus:ring-2 focus:ring-brand/20 disabled:cursor-not-allowed"
-                  aria-label="Độ dài video đích (giây)"
-                />
-                <span className="shrink-0 text-[11px] text-muted">giây</span>
+              {/* Độ dài video đích inputs (the auto-duration toggle lives on the
+                  checkbox group just below in this same left column, next to
+                  "Thêm nguồn"). Kept in the left column to balance the grid row height
+                  against the cover controls. */}
+              <Field
+                label={
+                  autoDuration
+                    ? 'Độ dài video đích — Tự động'
+                    : `Độ dài video đích — ${Math.floor(targetSec / 60)}:${String(targetSec % 60).padStart(2, '0')}`
+                }
+                hint={
+                  reusedScript
+                    ? 'Không áp dụng khi dùng lại kịch bản đã lưu — độ dài theo kịch bản đã cố định.'
+                    : autoDuration
+                      ? 'Độ dài theo video gốc; nếu là chế độ Tóm tắt sẽ cắt bớt phần thừa.'
+                      : 'Cô đọng nguồn vào độ dài này; chỉnh phút và giây (từ 1 giây đến 50 phút).'
+                }
+              >
+                {/* In auto/reused states the inputs are non-editable; collapse the row
+                    entirely so the block doesn't leave a large empty area. The Field
+                    label + hint already convey the auto behavior. */}
+                {autoDuration || reusedScript ? null : (
+                  <div className="flex h-9 items-center gap-2">
+                    <input
+                      type="number"
+                      min={0}
+                      max={50}
+                      step={1}
+                      value={Math.floor(targetSec / 60)}
+                      onChange={(e) => {
+                        // Recombine minutes + current seconds, clamp to 1s..50min.
+                        const mins = Number.isFinite(e.target.valueAsNumber) ? Math.max(0, Math.floor(e.target.valueAsNumber)) : 0
+                        const secs = targetSec % 60
+                        setTargetSec(Math.min(MAX_TARGET_SEC, Math.max(MIN_TARGET_SEC, mins * 60 + secs)))
+                      }}
+                      disabled={autoDuration || !!reusedScript}
+                      className="h-9 w-16 rounded-lg border border-line bg-panel px-2 text-sm text-fg outline-none transition focus:border-brand/50 focus:ring-2 focus:ring-brand/20 disabled:cursor-not-allowed"
+                      aria-label="Độ dài video đích (phút)"
+                    />
+                    <span className="shrink-0 text-[11px] text-muted">phút</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={59}
+                      step={1}
+                      value={targetSec % 60}
+                      onChange={(e) => {
+                        // Recombine current minutes + seconds, clamp to 1s..50min.
+                        const mins = Math.floor(targetSec / 60)
+                        const secs = Number.isFinite(e.target.valueAsNumber) ? Math.min(59, Math.max(0, Math.floor(e.target.valueAsNumber))) : 0
+                        setTargetSec(Math.min(MAX_TARGET_SEC, Math.max(MIN_TARGET_SEC, mins * 60 + secs)))
+                      }}
+                      disabled={autoDuration || !!reusedScript}
+                      className="h-9 w-16 rounded-lg border border-line bg-panel px-2 text-sm text-fg outline-none transition focus:border-brand/50 focus:ring-2 focus:ring-brand/20 disabled:cursor-not-allowed"
+                      aria-label="Độ dài video đích (giây)"
+                    />
+                    <span className="shrink-0 text-[11px] text-muted">giây</span>
+                  </div>
+                )}
+              </Field>
+
+              {/* Checkboxes + auto-publish block live in the LEFT column (moved out of
+                  the below-grid full-width flow) so a freely-growing cover textarea in
+                  the RIGHT column never shifts them: the grid row grows but this
+                  top-anchored column keeps its content in place. Extra height from a
+                  tall textarea appears as empty space below the publish block. */}
+              {/* Two checkboxes stacked vertically: auto-duration then add-source-credit. */}
+              <div className="flex flex-col gap-2">
+                <label className={`flex items-center gap-2.5 text-sm ${reusedScript ? 'cursor-not-allowed opacity-40' : 'cursor-pointer'}`}>
+                  <input
+                    type="checkbox"
+                    checked={autoDuration || !!reusedScript}
+                    onChange={(e) => setAutoDuration(e.target.checked)}
+                    disabled={!!reusedScript}
+                    className="h-4 w-4 rounded border-line bg-panel2 accent-[var(--color-brand)] disabled:cursor-not-allowed"
+                  />
+                  <span>Tự động độ dài (theo video gốc)</span>
+                </label>
+
+                <label className="flex cursor-pointer items-center gap-2.5 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={addCredit}
+                    onChange={(e) => setAddCredit(e.target.checked)}
+                    className="h-4 w-4 rounded border-line bg-panel2 accent-[var(--color-brand)]"
+                  />
+                  <span>Thêm nguồn (logo + @handle) ở cuối video</span>
+                </label>
               </div>
-            </Field>
-          </div>
 
-          <label className={`flex items-center gap-2.5 text-sm ${reusedScript ? 'cursor-not-allowed opacity-40' : 'cursor-pointer'}`}>
-            <input
-              type="checkbox"
-              checked={autoDuration}
-              onChange={(e) => setAutoDuration(e.target.checked)}
-              disabled={!!reusedScript}
-              className="h-4 w-4 rounded border-line bg-panel2 accent-[var(--color-brand)] disabled:cursor-not-allowed"
-            />
-            <span>Tự động độ dài (theo video gốc)</span>
-          </label>
+              <div>
+                <label className="flex cursor-pointer items-center gap-2.5 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={publish}
+                    onChange={(e) => setPublish(e.target.checked)}
+                    className="h-4 w-4 rounded border-line bg-panel2 accent-[var(--color-brand)]"
+                  />
+                  <span>Tự động publish</span>
+                </label>
+                {(() => {
+                  // Off → static manual-publish hint.
+                  if (!publish) {
+                    return <p className="ml-[26px] mt-1 text-[11px] text-muted">Tắt: chỉ tạo video, đăng thủ công sau ở mục Video.</p>
+                  }
+                  // On but no platform picked → warning tone, won't auto-publish.
+                  if (!publishPlatform) {
+                    return (
+                      <p className="ml-[26px] mt-1 text-[11px] text-amber-500">
+                        Chưa chọn nền tảng ở trên — sẽ KHÔNG tự đăng. Hãy chọn nền tảng để bật tự đăng.
+                      </p>
+                    )
+                  }
+                  // On + platform picked, but that platform isn't linked on THIS page →
+                  // backend will skip publishing. Surface it honestly.
+                  if (pageLinkedPlatforms && !pageLinkedPlatforms.has(publishPlatform)) {
+                    return (
+                      <p className="ml-[26px] mt-1 text-[11px] text-amber-500">
+                        Nền tảng này chưa liên kết ở trang đang chọn — sẽ không tự đăng.
+                      </p>
+                    )
+                  }
+                  // On + platform picked (and linked here, or link state unknown) → will publish.
+                  const platformLabel =
+                    specs?.find((s) => s.platform === publishPlatform)?.label ?? publishPlatform
+                  return (
+                    <p className="ml-[26px] mt-1 text-[11px] text-muted">
+                      Sẽ tự đăng lên: {platformLabel} (kênh của trang đang chọn).
+                    </p>
+                  )
+                })()}
+              </div>
+            </div>
 
-          <label className="flex cursor-pointer items-center gap-2.5 text-sm">
-            <input
-              type="checkbox"
-              checked={addCredit}
-              onChange={(e) => setAddCredit(e.target.checked)}
-              className="h-4 w-4 rounded border-line bg-panel2 accent-[var(--color-brand)]"
-            />
-            <span>Thêm nguồn (logo + @handle) ở cuối video</span>
-          </label>
-
-          <div>
-            <label className="flex cursor-pointer items-center gap-2.5 text-sm">
-              <input
-                type="checkbox"
-                checked={publish}
-                onChange={(e) => setPublish(e.target.checked)}
-                className="h-4 w-4 rounded border-line bg-panel2 accent-[var(--color-brand)]"
-              />
-              <span>Tự động publish</span>
-            </label>
-            {(() => {
-              // Off → static manual-publish hint.
-              if (!publish) {
-                return <p className="ml-[26px] mt-1 text-[11px] text-muted">Tắt: chỉ tạo video, đăng thủ công sau ở mục Video.</p>
-              }
-              // On but no platform picked → warning tone, won't auto-publish.
-              if (!publishPlatform) {
-                return (
-                  <p className="ml-[26px] mt-1 text-[11px] text-amber-500">
-                    Chưa chọn nền tảng ở trên — sẽ KHÔNG tự đăng. Hãy chọn nền tảng để bật tự đăng.
-                  </p>
-                )
-              }
-              // On + platform picked, but that platform isn't linked on THIS page →
-              // backend will skip publishing. Surface it honestly.
-              if (pageLinkedPlatforms && !pageLinkedPlatforms.has(publishPlatform)) {
-                return (
-                  <p className="ml-[26px] mt-1 text-[11px] text-amber-500">
-                    Nền tảng này chưa liên kết ở trang đang chọn — sẽ không tự đăng.
-                  </p>
-                )
-              }
-              // On + platform picked (and linked here, or link state unknown) → will publish.
-              const platformLabel =
-                specs?.find((s) => s.platform === publishPlatform)?.label ?? publishPlatform
-              return (
-                <p className="ml-[26px] mt-1 text-[11px] text-muted">
-                  Sẽ tự đăng lên: {platformLabel} (kênh của trang đang chọn).
+            {/* Cover column. On mobile (single column) render it FIRST via order-first
+                so cover controls stay near the top; sm:order-none restores the natural
+                left-then-right order on desktop (where anchoring the checkboxes in the
+                left column is what matters). */}
+            <div className="order-first flex min-w-0 flex-col gap-2 sm:order-none">
+              {/* Column title, aligned horizontally with the "Audio gốc" Field label
+                  on the left. Uses the same label typography (mb-1.5 text-xs font-medium
+                  text-muted) so the two column headers line up cleanly. Always shown so
+                  the layout never jumps. */}
+              <span className="mb-1.5 block text-xs font-medium text-muted">Nhập tiêu đề hoặc dán link trước</span>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="outline"
+                  onClick={makeCover}
+                  disabled={coverLoading || (!coverTitle && !coverPrompt.trim())}
+                  className="shrink-0"
+                >
+                  {coverLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImageIcon className="h-4 w-4" />}
+                  {coverLoading
+                    ? 'Đang tạo cover…'
+                    : 'Tạo Cover'}
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => setShowSavedCovers(true)}
+                  disabled={coverLoading || !pageName}
+                  className="shrink-0"
+                >
+                  <FolderOpen className="h-4 w-4" /> Duyệt
+                </Button>
+              </div>
+              {/* Thin progress bar while a cover generates. */}
+              {coverLoading && (
+                <div className="h-1 w-full overflow-hidden rounded-full bg-panel2">
+                  <div
+                    className="h-full rounded-full bg-brand transition-all duration-300"
+                    style={{ width: `${Math.max(2, coverPct)}%` }}
+                  />
+                </div>
+              )}
+              {/* The actual prompt sent to SDXL, shown while generating. */}
+              {coverLoading && coverPromptShown && (
+                <p className="line-clamp-3 whitespace-pre-wrap break-words text-[11px] text-muted">
+                  <span className="font-medium">Prompt:</span> {coverPromptShown}
                 </p>
-              )
-            })()}
+              )}
+              {/* Expandable multi-line prompt. No Textarea primitive exists in ui.tsx,
+                  so this native <textarea> reuses the same field styling as TextInput
+                  (border/bg/text/focus tokens) minus the fixed h-9, and starts at ~2
+                  rows but is user-resizable vertically (resize-y).
+
+                  NO HEIGHT CAP: the textarea grows freely to any size the user drags.
+                  The 3 checkboxes are NOT affected because they now live in the LEFT
+                  grid column (with "Audio gốc" + "Độ dài"). Growing this RIGHT cell only
+                  grows the shared grid-row height; the left column stays top-anchored, so
+                  the checkboxes keep their position (extra height is empty space at the
+                  bottom of the left column). */}
+              <textarea
+                value={coverPrompt}
+                onChange={(e) => setCoverPrompt(e.target.value)}
+                placeholder="Để trống sẽ tự tạo từ tiêu đề + nội dung"
+                rows={2}
+                disabled={coverLoading}
+                className="w-full min-h-[4.5rem] resize-y rounded-lg border border-line bg-panel px-3 py-2 text-sm text-fg outline-none transition placeholder:text-muted/70 focus:border-brand/50 focus:ring-2 focus:ring-brand/20 disabled:cursor-not-allowed disabled:opacity-50"
+              />
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] text-muted/80">Prompt ảnh Cover (tuỳ chọn)</span>
+                {coverPrompt.trim() && !coverLoading && (
+                  <button
+                    type="button"
+                    onClick={() => setCoverPrompt('')}
+                    className="inline-flex items-center gap-1 text-[11px] text-muted/80 transition hover:text-rose-400"
+                  >
+                    <X className="h-3 w-3" /> Xoá nội dung
+                  </button>
+                )}
+              </div>
+
+              {/* Title panel — only once a cover exists. The owner edits the
+                  auto-translated Vietnamese title; the backend re-renders it (owning
+                  ALL styling — position/color/gradient/plates) from the CLEAN base
+                  (coverBasePath), so re-applying an edited title never stacks. The
+                  result replaces the displayed `cover`. */}
+              {cover && (
+                <div className="mt-1 space-y-2.5 rounded-lg border border-line bg-panel2/40 p-3">
+                  <div className="flex items-center gap-1.5 text-xs font-medium text-fg">
+                    <Type className="h-3.5 w-3.5 text-muted" /> Chữ trên ảnh cover
+                  </div>
+                  <textarea
+                    value={coverText}
+                    onChange={(e) => setCoverText(e.target.value)}
+                    placeholder="Tiêu đề tiếng Việt hiển thị trên cover (xuống dòng để ngắt dòng)"
+                    rows={2}
+                    className="w-full resize-y rounded-lg border border-line bg-panel px-3 py-2 text-sm text-fg outline-none transition placeholder:text-muted/70 focus:border-brand/50 focus:ring-2 focus:ring-brand/20"
+                  />
+                  <p className="text-[11px] text-muted/80">Mẹo: bao chữ trong "..." hoặc '...' để chữ đó có nền.</p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      variant="outline"
+                      onClick={applyCoverText}
+                      disabled={coverTextLoading || !coverText.trim() || !cover}
+                      className="shrink-0"
+                    >
+                      {coverTextLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Type className="h-4 w-4" />}
+                      {coverTextLoading ? 'Đang áp dụng…' : 'Áp dụng'}
+                    </Button>
+                    <span className="text-[11px] text-muted/80">Sửa tiêu đề rồi bấm lại để render lại từ ảnh gốc.</span>
+                  </div>
+
+                  {/* Manual title-style knobs. Each defaults to Auto (backend does its
+                      seeded/auto thing); pinning a knob overrides only that dimension.
+                      A fresh seed is sent each "Áp dụng", so knobs left on Auto still
+                      re-roll a new variation every click. */}
+                  <div className="space-y-3 border-t border-line/60 pt-2.5">
+                    {/* Position ("Auto" toggle + 3×3 anchor grid) and Căn chữ, side by side.
+                        items-START (not items-end): the anchor grid is ~3x taller than the
+                        align row, so bottom-aligning dropped "Căn chữ" to the grid's bottom
+                        edge and it read as a separate row. Top-aligning puts both LABELS on
+                        the same line, which is what the owner asked for. */}
+                    <div className="flex flex-wrap items-start gap-4">
+                      <div>
+                        <span className="mb-1 block text-[11px] text-muted">Vị trí</span>
+                        <div className="flex items-start gap-2">
+                          <button
+                            type="button"
+                            onClick={() => setCoverPosition('auto')}
+                            aria-pressed={coverPosition === 'auto'}
+                            className={`h-6 rounded border px-2 text-[11px] font-medium transition ${
+                              coverPosition === 'auto' ? 'border-brand bg-brand/20 text-fg' : 'border-line bg-panel text-muted hover:border-brand/40'
+                            }`}
+                          >
+                            Auto
+                          </button>
+                          <div className="grid grid-cols-3 gap-1">
+                            {COVER_TITLE_ANCHORS.map((pos) => {
+                              const active = coverPosition === pos
+                              const [vert, horiz] = pos.split('-')
+                              const vAlign = vert === 'top' ? 'items-start' : vert === 'center' ? 'items-center' : 'items-end'
+                              const hAlign = horiz === 'left' ? 'justify-start' : horiz === 'right' ? 'justify-end' : 'justify-center'
+                              return (
+                                <button
+                                  key={pos}
+                                  type="button"
+                                  onClick={() => setCoverPosition(pos)}
+                                  aria-label={pos}
+                                  aria-pressed={active}
+                                  title={pos}
+                                  className={`flex h-6 w-6 rounded border p-1 transition ${vAlign} ${hAlign} ${
+                                    active ? 'border-brand bg-brand/20' : 'border-line bg-panel hover:border-brand/40'
+                                  }`}
+                                >
+                                  <span className={`block h-1 w-2.5 rounded-sm ${active ? 'bg-brand' : 'bg-muted/60'}`} />
+                                </button>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Căn chữ: how the rows align inside the title column. Auto =
+                          backend's centered + seeded jitter; left/right flush every row
+                          to that edge (and align the lines inside a multi-line row). */}
+                      <div>
+                        <span className="mb-1 block text-[11px] text-muted">Căn chữ</span>
+                        <div className="flex items-center gap-1">
+                          {([
+                            ['auto', 'Auto', null],
+                            ['left', 'Trái', AlignLeft],
+                            ['center', 'Giữa', AlignCenter],
+                            ['right', 'Phải', AlignRight],
+                          ] as const).map(([val, label, Icon]) => {
+                            const active = coverAlign === val
+                            return (
+                              <button
+                                key={val}
+                                type="button"
+                                onClick={() => setCoverAlign(val)}
+                                aria-pressed={active}
+                                title={label}
+                                aria-label={label}
+                                className={`flex h-6 items-center gap-1 rounded border px-2 text-[11px] font-medium transition ${
+                                  active ? 'border-brand bg-brand/20 text-fg' : 'border-line bg-panel text-muted hover:border-brand/40'
+                                }`}
+                              >
+                                {Icon ? <Icon className="h-3.5 w-3.5" /> : label}
+                              </button>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Plate màu (gradient): key color (start) + gradient-end color +
+                        its Auto toggle + gradient checkbox. The END color only matters
+                        when NOT Auto and Gradient is ON, so it greys out otherwise. */}
+                    <div className="flex flex-wrap items-end gap-4">
+                      <div>
+                        <span className="mb-1 block text-[11px] text-muted">Plate màu gradient</span>
+                        <div className="flex items-end gap-1.5">
+                          {/* Màu 1 (gradient START) */}
+                          <div>
+                            <span className="mb-0.5 block text-[10px] text-muted/70">Từ</span>
+                            <input
+                              type="color"
+                              value={coverKeyColor}
+                              onChange={(e) => setCoverKeyColor(e.target.value)}
+                              disabled={coverKeyColorAuto}
+                              aria-label="Màu plate 1 (từ)"
+                              className="h-8 w-10 cursor-pointer rounded border border-line bg-panel disabled:cursor-not-allowed disabled:opacity-40"
+                            />
+                          </div>
+                          {/* Màu 2 (gradient END) — only relevant when manual + gradient on. */}
+                          <div className={coverKeyColorAuto || !coverGradient ? 'pointer-events-none opacity-40' : ''}>
+                            <span className="mb-0.5 block text-[10px] text-muted/70">Đến</span>
+                            <input
+                              type="color"
+                              value={coverKeyColor2}
+                              onChange={(e) => setCoverKeyColor2(e.target.value)}
+                              disabled={coverKeyColorAuto || !coverGradient}
+                              aria-label="Màu plate 2 (đến)"
+                              className="h-8 w-10 cursor-pointer rounded border border-line bg-panel disabled:cursor-not-allowed disabled:opacity-40"
+                            />
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setCoverKeyColorAuto((a) => !a)}
+                            aria-pressed={coverKeyColorAuto}
+                            className={`h-8 rounded border px-2 text-xs font-medium transition ${
+                              coverKeyColorAuto ? 'border-brand bg-brand/20 text-fg' : 'border-line bg-panel text-muted hover:border-brand/40'
+                            }`}
+                          >
+                            Auto
+                          </button>
+                        </div>
+                      </div>
+                      <div>
+                        <span className="mb-1 block text-[11px] text-muted">Gradient</span>
+                        <button
+                          type="button"
+                          onClick={() => setCoverGradient((g) => !g)}
+                          aria-pressed={coverGradient}
+                          className={`h-8 rounded border px-3 text-xs font-medium transition ${
+                            coverGradient ? 'border-brand bg-brand/20 text-fg' : 'border-line bg-panel text-muted hover:border-brand/40'
+                          }`}
+                        >
+                          {coverGradient ? 'Bật' : 'Tắt'}
+                        </button>
+                      </div>
+
+                      {/* Plate màu border: the text OUTLINE color for every row. Auto lets
+                          the backend pick a contrasting outline; a manual pick is honored
+                          verbatim (the backend skips its contrast guard). */}
+                      <div>
+                        <span className="mb-1 block text-[11px] text-muted">Plate màu border</span>
+                        <div className="flex items-end gap-1.5">
+                          <input
+                            type="color"
+                            value={coverStrokeColor}
+                            onChange={(e) => setCoverStrokeColor(e.target.value)}
+                            disabled={coverStrokeAuto}
+                            aria-label="Màu border chữ"
+                            className="h-8 w-10 cursor-pointer rounded border border-line bg-panel disabled:cursor-not-allowed disabled:opacity-40"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setCoverStrokeAuto((a) => !a)}
+                            aria-pressed={coverStrokeAuto}
+                            className={`h-8 rounded border px-2 text-xs font-medium transition ${
+                              coverStrokeAuto ? 'border-brand bg-brand/20 text-fg' : 'border-line bg-panel text-muted hover:border-brand/40'
+                            }`}
+                          >
+                            Auto
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Font size + tilt sliders, each with an Auto toggle. */}
+                    <div className="flex flex-wrap items-end gap-4">
+                      <div className="min-w-[10rem] flex-1">
+                        <div className="mb-1 flex items-center justify-between gap-2">
+                          <span className="text-[11px] text-muted">
+                            Cỡ chữ · {coverFontAuto ? 'Auto' : `${Math.round(coverFontScale * 100)}%`}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setCoverFontAuto((a) => !a)}
+                            aria-pressed={coverFontAuto}
+                            className={`h-6 rounded border px-2 text-[11px] font-medium transition ${
+                              coverFontAuto ? 'border-brand bg-brand/20 text-fg' : 'border-line bg-panel text-muted hover:border-brand/40'
+                            }`}
+                          >
+                            Auto
+                          </button>
+                        </div>
+                        <input
+                          type="range"
+                          min={0.2}
+                          max={1.5}
+                          step={0.05}
+                          value={coverFontScale}
+                          onChange={(e) => setCoverFontScale(Number(e.target.value))}
+                          disabled={coverFontAuto}
+                          aria-label="Cỡ chữ"
+                          className="w-full accent-[var(--color-brand)] disabled:opacity-40"
+                        />
+                      </div>
+                      <div className="min-w-[10rem] flex-1">
+                        <div className="mb-1 flex items-center justify-between gap-2">
+                          <span className="text-[11px] text-muted">
+                            Độ nghiêng · {coverTiltAuto ? 'Auto' : `${coverTilt}°`}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setCoverTiltAuto((a) => !a)}
+                            aria-pressed={coverTiltAuto}
+                            className={`h-6 rounded border px-2 text-[11px] font-medium transition ${
+                              coverTiltAuto ? 'border-brand bg-brand/20 text-fg' : 'border-line bg-panel text-muted hover:border-brand/40'
+                            }`}
+                          >
+                            Auto
+                          </button>
+                        </div>
+                        <input
+                          type="range"
+                          min={-20}
+                          max={20}
+                          step={1}
+                          value={coverTilt}
+                          onChange={(e) => setCoverTilt(Number(e.target.value))}
+                          disabled={coverTiltAuto}
+                          aria-label="Độ nghiêng"
+                          className="w-full accent-[var(--color-brand)] disabled:opacity-40"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
+
+          {/* Facebook hashtags are now generated automatically by the pipeline
+              after the script is produced; they are no longer set here. */}
+          <p className="text-xs text-muted">
+            Hashtag Facebook sẽ tự tạo sau khi có kịch bản — xem & copy ở danh sách Video.
+          </p>
 
           <div className="flex items-center gap-3 pt-1">
-            <Button onClick={create} disabled={creating || !renderInstalled || !voiceModelInstalled || !link.trim()}>
+            <Button onClick={create} disabled={creating || coverLoading || !renderInstalled || !voiceModelInstalled || !link.trim()}>
               {creating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Wand2 className="h-4 w-4" />}
               {creating ? 'Đang thêm…' : 'Tạo video'}
             </Button>
+            {/* Block submit while a cover is still generating so the owner can't
+                create the video before the cover they intend to use is captured
+                (root cause of "cover doesn't show" — submitting mid-generation). */}
+            {coverLoading && <span className="text-xs text-amber-500">Đang tạo cover — chờ xong rồi tạo video.</span>}
             {!renderInstalled && <span className="text-xs text-amber-500">Model dựng chưa cài — chọn cái khác.</span>}
             {renderInstalled && !voiceModelInstalled && <span className="text-xs text-amber-500">Model lồng tiếng chưa cài — chọn cái khác.</span>}
             {msg && <span className={`text-xs ${msg.kind === 'ok' ? 'text-emerald-400' : 'text-rose-400'}`}>{msg.text}</span>}
@@ -1723,19 +3626,32 @@ function Studio({
         {/* Right: source link input + link preview (+30% larger) + source info */}
         <div>
           <Field label="Link nguồn">
-            <div className="relative">
-              <Link2 className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
-              <TextInput value={link} onChange={setLink} placeholder="https://youtube.com/watch?v=…" className="pl-8 pr-9" />
-              {link && (
-                <button
-                  type="button"
-                  onClick={() => setLink('')}
-                  aria-label="Xoá link"
-                  className="absolute right-2 top-1/2 grid h-5 w-5 -translate-y-1/2 place-items-center rounded text-muted transition hover:bg-panel2 hover:text-fg"
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
-              )}
+            <div className="flex items-center gap-2">
+              <div className="relative flex-1">
+                <Link2 className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
+                <TextInput value={link} onChange={setLink} placeholder="https://youtube.com/watch?v=…" className="pl-8 pr-9" />
+                {link && (
+                  <button
+                    type="button"
+                    onClick={() => setLink('')}
+                    aria-label="Xoá link"
+                    className="absolute right-2 top-1/2 grid h-5 w-5 -translate-y-1/2 place-items-center rounded text-muted transition hover:bg-panel2 hover:text-fg"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </div>
+              {/* Batch create: paste many links → one job per link with the CURRENT
+                  Studio settings. Same install-gate as single-create so a batch can't
+                  queue unrunnable jobs. Sits inline with the source-link input. */}
+              <Button
+                variant="outline"
+                onClick={() => setShowBatch(true)}
+                disabled={creating || coverLoading || !renderInstalled || !voiceModelInstalled}
+                className="shrink-0"
+              >
+                <ListPlus className="h-4 w-4" /> Thêm danh sách
+              </Button>
             </div>
           </Field>
           <span className="mb-1.5 mt-4 block text-xs font-medium text-muted">Xem trước nguồn</span>
@@ -1763,6 +3679,56 @@ function Studio({
               </div>
             </div>
           )}
+
+          {/* AI cover preview — shown once a cover has been generated (or while it
+              is generating). Sits right below the source preview. */}
+          {(cover || coverLoading) && (
+            <div className="mt-4">
+              <span className="mb-1.5 block text-xs font-medium text-muted">Ảnh Cover</span>
+              <div className="grid min-h-[9rem] place-items-center overflow-hidden rounded-xl border border-line bg-panel2 p-2">
+                {coverLoading ? (
+                  <span className="inline-flex items-center gap-1.5 text-xs text-muted">
+                    <Loader2 className="h-4 w-4 animate-spin" /> Đang tạo cover… {coverPct}%
+                  </span>
+                ) : cover ? (
+                  <img src={cover.url} alt="Ảnh cover" className="h-auto w-auto max-h-[60vh] max-w-full rounded-lg object-contain" />
+                ) : null}
+              </div>
+              {coverErr && <p className="mt-1.5 text-[11px] text-rose-400">{coverErr}</p>}
+              {/* Use-cover toggle — feeds the `useCover` boolean into the job. */}
+              <div className="mt-2.5 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => cover && setUseCover((u) => !u)}
+                  disabled={!cover}
+                  aria-pressed={useCover && !!cover}
+                  className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                    useCover && !!cover ? 'border-brand bg-brand/20 text-fg' : 'border-line bg-panel text-muted hover:border-brand/40'
+                  }`}
+                >
+                  {useCover && !!cover ? <CheckCircle2 className="h-4 w-4 text-brand" /> : <Square className="h-4 w-4" />}
+                  Sử dụng ảnh Cover
+                </button>
+                {/* Clear the cover from the PREVIEW only — in-memory selection reset,
+                    no file/cache delete. The video then creates with no cover
+                    (useCover=false path). Keeps coverPrompt so the owner can regen. */}
+                {cover && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCover(null)
+                      setUseCover(false)
+                      setCoverBasePath(null)
+                      setCoverPromptShown('')
+                    }}
+                    className="inline-flex items-center gap-2 rounded-lg border border-line bg-panel px-3 py-2 text-sm font-medium text-muted transition hover:border-brand/40 hover:text-fg"
+                  >
+                    <X className="h-4 w-4" /> Bỏ cover
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -1781,6 +3747,102 @@ function Studio({
             setShowScriptPicker(false)
           }}
         />
+      )}
+
+      {showSavedCovers && (
+        <SavedCoverPicker
+          pageName={pageName}
+          onClose={() => setShowSavedCovers(false)}
+          onPick={(picked) => {
+            // A browsed cover is an existing image, not a fresh generation: it has no
+            // seed/styleIndex, so use 0/0 (the assembly only needs path+url).
+            setCover({ path: picked.path, url: picked.url, seed: 0, styleIndex: 0 })
+            // Compositing base for an edited title. Prefer the CLEAN title-less sibling
+            // the backend resolves (`basePath`); only fall back to the picked image when
+            // there is none. Using `picked.path` unconditionally (the old behavior) meant
+            // that picking a cover which ALREADY had a title baked in composited the new
+            // title ON TOP of the old one instead of replacing it.
+            setCoverBasePath(picked.basePath || picked.path)
+            setUseCover(true)
+            setShowSavedCovers(false)
+            success('Đã chọn cover')
+          }}
+        />
+      )}
+
+      {showBatch && (
+        <BatchListModal
+          pageId={pageId}
+          // Mirror EXACTLY the single-create body: read the SAME state the normal
+          // "Tạo video" uses so a batch job == a normal job but for many links.
+          // useCover is only meaningful when a cover was actually generated (same
+          // useCoverNow guard as create()).
+          settings={{
+            editMode,
+            voice: voiceKey || null,
+            aspect,
+            renderModel,
+            voiceCloneModel,
+            ...llmPayload,
+            srcAudioVolume,
+            addCredit,
+            useCover: useCover && !!cover,
+            coverImagePath: useCover && !!cover ? cover.path : null,
+          }}
+          hasOuterLink={!!link.trim()}
+          onAdoptFirst={(l, t) => {
+            // Fill the Studio's outer source-link (+ title) so "Tạo video" enables;
+            // its own paste-probe/preview re-engages off the new link.
+            setLink(l)
+            if (t) setTitle(t)
+          }}
+          onClose={() => setShowBatch(false)}
+          onCreated={onCreated}
+        />
+      )}
+
+      {reuseGuard && (
+        <Modal
+          open
+          onClose={() => setReuseGuard(null)}
+          title="Sẽ SINH KỊCH BẢN MỚI (không dùng lại kịch bản cũ)"
+          maxWidthClass="max-w-lg"
+        >
+          <div className="space-y-4">
+            <p className="text-sm text-fg">
+              Video gần nhất cho nguồn này đã{' '}
+              <span className="font-medium text-brand">dùng lại kịch bản #{reuseGuard.lastVideoId}</span>.
+              Lần này lựa chọn dùng lại đã bị bỏ, nên pipeline sẽ{' '}
+              <span className="font-medium">viết một kịch bản HOÀN TOÀN MỚI</span> thay vì dùng lại.
+            </p>
+            <p className="text-[13px] text-muted">
+              Nếu bạn muốn dùng lại kịch bản cũ, hãy chọn lại kịch bản. Nếu thực sự muốn tạo kịch bản mới, cứ tiếp tục.
+            </p>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <Button variant="ghost" onClick={() => setReuseGuard(null)}>
+                Huỷ
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setReuseGuard(null)
+                  setShowScriptPicker(true)
+                }}
+              >
+                <RotateCcw className="h-4 w-4" /> Chọn lại kịch bản để dùng lại
+              </Button>
+              <Button
+                variant="danger"
+                onClick={() => {
+                  setReuseGuard(null)
+                  void create(true)
+                }}
+              >
+                <FileText className="h-4 w-4" /> Sinh kịch bản mới
+              </Button>
+            </div>
+          </div>
+        </Modal>
       )}
 
       {showAddVoice && (
@@ -1816,6 +3878,29 @@ function WorkflowProgress({ pageId, trigger }: { pageId: number; trigger?: numbe
   const { success, error: toastError } = useToast()
   const { videos } = useData()
   const [job, setJob] = useState<import('../types').Job | null>(null)
+  // All pending (not-yet-done, not-running) jobs waiting BEHIND the displayed one:
+  // both 'held' (saved source-list rows, not released) and 'queued' (released).
+  // These are the sources shown as "đang chờ"; the chip lists them on click.
+  const [pendingJobs, setPendingJobs] = useState<import('../types').Job[]>([])
+  // Whether the pending-jobs popover/modal is open.
+  const [pendingOpen, setPendingOpen] = useState(false)
+  // Id of the pending job currently being deleted (row spinner + disable).
+  const [deletingId, setDeletingId] = useState<number | null>(null)
+
+  // Delete one pending (held/queued) source from the review list. Optimistically
+  // drops it from local state for instant feedback; the next poll tick reconciles.
+  const deletePending = async (id: number) => {
+    setDeletingId(id)
+    try {
+      await api.deleteJob(id)
+      setPendingJobs((prev) => prev.filter((j) => j.id !== id))
+      success('Đã xoá nguồn khỏi hàng chờ')
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : 'Không xoá được nguồn')
+    } finally {
+      setDeletingId(null)
+    }
+  }
   const [clearing, setClearing] = useState(false)
   const [retrying, setRetrying] = useState(false)
   const [retryErr, setRetryErr] = useState<string | null>(null)
@@ -1834,18 +3919,41 @@ function WorkflowProgress({ pageId, trigger }: { pageId: number; trigger?: numbe
   // the dismissed-id so the fresh job cleanly re-engages the diagram instead of
   // being suppressed by a leftover dismissed id from the previous run.
   const trackedIdRef = useRef<number | null>(null)
+  // Monotonically-increasing chip index + progress pct: prevents the active chip
+  // and the numeric percentage from jumping backwards during per-scene loops or
+  // the reuse-script path (which jumps from script 40% directly to voice 55%+).
+  const maxActiveIdxRef = useRef<number>(-1)
+  const maxPctRef = useRef<number>(0)
+  const prevJobIdForChipsRef = useRef<number | null>(null)
   const [sys, setSys] = useState<SysStats | null>(null)
   // Live clock for the elapsed timer; only ticks while a job is in flight.
   const [now, setNow] = useState(() => Date.now())
 
-  // Poll the page's most recent job so the diagram tracks it live.
+  // Poll the page's active jobs so the diagram tracks the running one live.
+  // When multiple jobs are in flight (one running + N queued), show only the
+  // running job's progress and expose the queued count as a notification chip.
   useEffect(() => {
     let cancelled = false
     const tick = async () => {
       try {
         const jobs = (await fetch('/api/jobs').then((r) => r.json())) as import('../types').Job[]
-        const latest = jobs.filter((j) => j.pageId === pageId).sort((a, b) => b.id - a.id)[0] ?? null
+        const pageJobs = jobs.filter((j) => j.pageId === pageId).sort((a, b) => b.id - a.id)
+        // Prefer the running job; fall back to the latest queued one (next up).
+        const running = pageJobs.find((j) => j.status === 'running') ?? null
+        // NEVER track a 'held' job as the displayed job: held = saved-but-not-released
+        // source-list rows (a batch add) that are NOT running, so treating one as the
+        // tracked job made the elapsed clock tick for a job that hadn't started ("counter
+        // tự chạy" after adding links). Fall back to the newest NON-held job (running/
+        // queued/done/failed/stopped); when only held jobs exist, show idle — the "N đang
+        // chờ" chip already surfaces them.
+        const latest = running ?? pageJobs.find((j) => j.status !== 'held') ?? null
+        // Pending jobs waiting BEHIND the displayed one (exclude it): both 'held'
+        // (saved, not released) and 'queued' (released, next up).
+        const waiting = pageJobs.filter(
+          (j) => (j.status === 'queued' || j.status === 'held') && j.id !== latest?.id,
+        )
         if (!cancelled) {
+          setPendingJobs(waiting)
           // The poll selected a DIFFERENT job than we were tracking (a newly
           // created/retried job — always a higher id). Clear any leftover
           // dismissed-id BEFORE the done-guard so the fresh job re-engages the
@@ -1889,10 +3997,25 @@ function WorkflowProgress({ pageId, trigger }: { pageId: number; trigger?: numbe
         dismissedDoneIdRef.current = id
         trackedIdRef.current = null
         setJob(null)
+        setPendingJobs([])
       }, 3000)
       return () => clearTimeout(t)
     }
   }, [job])
+
+  // When a job reaches ANY terminal state (done / failed / stopped), reset the
+  // monotonic chip-index + pct floors so the last run's progress can never bleed
+  // forward into the next job's diagram (which would otherwise show steps as
+  // already-"done" before the new job actually reaches them). The visible
+  // failed/stopped panel (with its retry button) is unaffected — those refs only
+  // gate forward-motion of the chips while a job is RUNNING.
+  const terminalStatus = job?.status === 'done' || job?.status === 'failed' || job?.status === 'stopped'
+  useEffect(() => {
+    if (terminalStatus) {
+      maxActiveIdxRef.current = -1
+      maxPctRef.current = 0
+    }
+  }, [terminalStatus, job?.id])
 
   // Elapsed timer: count up from createdAt while the job is in flight; freeze at
   // (finishedAt − createdAt) once the job reaches a terminal state. We only run
@@ -1919,15 +4042,22 @@ function WorkflowProgress({ pageId, trigger }: { pageId: number; trigger?: numbe
   // by editMode === 'dubbed' ALONE — renderModel is decoupled from editMode in the
   // backend and is NOT guaranteed to be 'passthrough-trim' for dubbed.
   const isDubbed = job?.editMode === 'dubbed'
+  const isPassthrough = job?.renderModel === 'passthrough-trim'
   // Base alias for the normal path: 'image' (story/SDXL) → 'footage' chip; 'publish'
   // → 'render' so the last chip stays highlighted while the runner auto-uploads.
   // For dubbed, also alias 'needs_input' → 'script': the dubbed pipeline pauses for
   // source info right after the translate step, so keep the (last-before-render)
   // 'script' = "Dịch phụ đề" chip highlighted during that pause. Scoped to dubbed
   // so the normal path's needs_input handling is untouched.
+  // passthrough-trim removes the 'footage' chip from steps, so any runner step
+  // that emits 'footage' (clip-cut phase) or 'image' (shouldn't happen for
+  // passthrough, but defensive) must alias to 'cut' — otherwise stepKey='footage'
+  // lands on activeIdx=-1 and ALL chips go gray for the entire cut phase.
   const STEP_ALIAS: Record<string, string> = isDubbed
     ? { image: 'footage', publish: 'render', needs_input: 'script' }
-    : { image: 'footage', publish: 'render' }
+    : isPassthrough
+      ? { footage: 'cut', image: 'cut', publish: 'render' }
+      : { image: 'footage', publish: 'render' }
   const rawStep = job?.progressStep ?? ''
   const stepKey = STEP_ALIAS[rawStep] ?? rawStep
   // Chip set selection:
@@ -1936,14 +4066,22 @@ function WorkflowProgress({ pageId, trigger }: { pageId: number; trigger?: numbe
   //   ("Tải/Tạo hình") chip so the diagram has no gap; remaining chips renumber via
   //   their map index (i + 1) and arrows connect off the filtered length.
   // - else the full footage WORKFLOW_STEPS.
-  const isPassthrough = job?.renderModel === 'passthrough-trim'
   const steps = isDubbed
     ? DUBBED_WORKFLOW_STEPS
     : isPassthrough
       ? WORKFLOW_STEPS.filter((s) => s.key !== 'footage')
       : WORKFLOW_STEPS
-  const activeIdx = job ? steps.findIndex((s) => s.key === stepKey) : -1
+  // Reset monotonic floors when a different job takes over (retry / new job).
+  if ((job?.id ?? null) !== prevJobIdForChipsRef.current) {
+    maxActiveIdxRef.current = -1
+    maxPctRef.current = 0
+    prevJobIdForChipsRef.current = job?.id ?? null
+  }
   const running = job?.status === 'running'
+  const rawActiveIdx = job ? steps.findIndex((s) => s.key === stepKey) : -1
+  // While running, chips only move forward — never jump back to an earlier step.
+  if (running && rawActiveIdx >= 0) maxActiveIdxRef.current = Math.max(maxActiveIdxRef.current, rawActiveIdx)
+  const activeIdx = running ? maxActiveIdxRef.current : rawActiveIdx
   const done = job?.status === 'done'
   const failed = job?.status === 'failed'
   // 'stopped' = user stopped the job mid-run. A NEUTRAL terminal state: neither
@@ -1952,7 +4090,11 @@ function WorkflowProgress({ pageId, trigger }: { pageId: number; trigger?: numbe
   // reuse when available) — the backend always mints a new job id, it does NOT
   // continue the same row.
   const stopped = job?.status === 'stopped'
-  const pct = done ? 100 : (job?.progressPct ?? 0)
+  // Monotonic pct floor: reuse-script path jumps from script (40%) directly to
+  // voice (55%+) which can momentarily poll at a lower value. Keep the max seen.
+  const rawPct = done ? 100 : (job?.progressPct ?? 0)
+  if (running) maxPctRef.current = Math.max(maxPctRef.current, rawPct)
+  const pct = running ? maxPctRef.current : rawPct
   // The real-time value shown under the active chip: extract just the number
   // ("56%", "1/49", "12/42") from progressMsg, falling back to overall pct%.
   const progressValue = (() => {
@@ -1963,8 +4105,32 @@ function WorkflowProgress({ pageId, trigger }: { pageId: number; trigger?: numbe
   })()
   // When done, append the finished video's title to "Hoàn tất". Join via the
   // video's jobId; if no video / empty title, fall back to plain "Hoàn tất".
-  const doneTitle = done && job ? (videos.find((v) => v.jobId === job.id)?.title?.trim() ?? '') : ''
+  const doneVideo = done && job ? (videos.find((v) => v.jobId === job.id) ?? null) : null
+  const doneTitle = doneVideo?.title?.trim() ?? ''
   const doneLabel = doneTitle ? `Hoàn tất - ${doneTitle}` : 'Hoàn tất'
+  // Inline title editing for the just-finished video (mirrors Videos.tsx).
+  const [editingDoneTitle, setEditingDoneTitle] = useState(false)
+  const [doneTitleDraft, setDoneTitleDraft] = useState('')
+  const [savingDoneTitle, setSavingDoneTitle] = useState(false)
+  const saveDoneTitle = async () => {
+    if (!doneVideo) return
+    const next = doneTitleDraft.trim()
+    if (!next || next === doneVideo.title) {
+      setEditingDoneTitle(false)
+      return
+    }
+    setSavingDoneTitle(true)
+    try {
+      await api.updateVideoTitle(doneVideo.id, next)
+      await refresh()
+      setEditingDoneTitle(false)
+      success('Đã đổi tiêu đề')
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : 'Đổi tiêu đề thất bại')
+    } finally {
+      setSavingDoneTitle(false)
+    }
+  }
   // The error message is driven by the DATA field, not status: once the backend
   // nulls jobs.error (via clear-error), this becomes false and the block hides
   // — even if the job row keeps status='failed'. The 1.5s poll re-reads the row.
@@ -2073,30 +4239,99 @@ function WorkflowProgress({ pageId, trigger }: { pageId: number; trigger?: numbe
   return (
     <Card className="p-5">
       <div className="flex items-start justify-between gap-3">
-        <SectionTitle sub="Tiến trình pipeline của job mới nhất — đang ở bước nào, bao nhiêu phần trăm.">
+        <SectionTitle sub="Tiến trình pipeline của job mới nhất">
           Workflow
         </SectionTitle>
-        {job && (
-          <div className="flex shrink-0 items-center gap-2">
-            {/* Stop button — only while running. Sits to the LEFT of the timer.
-                Destructive red treatment; busy/disabled + inline error. */}
-            {running && (
-              <div className="flex flex-col items-end">
-                <button
-                  onClick={stop}
-                  disabled={stopping}
-                  title="Dừng workflow đang chạy"
-                  aria-label="Dừng workflow"
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-rose-500/50 bg-rose-500/10 px-2.5 py-1 text-sm font-semibold text-rose-600 transition hover:bg-rose-500/20 hover:text-rose-700 disabled:opacity-50 dark:text-rose-300 dark:hover:text-rose-200"
-                >
-                  {stopping
-                    ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    : <Square className="h-3.5 w-3.5 fill-current" />}
-                  Dừng
-                </button>
-                {stopErr && <p className="mt-1 line-clamp-2 text-right text-[10px] text-rose-500">{stopErr}</p>}
+        <div className="flex shrink-0 items-center gap-2">
+          {/* Queue notification chip — shown when 1+ jobs are waiting behind
+              the currently displayed one. Click to see the list of pending
+              sources (held + queued). Collapses the details into a compact badge
+              so the progress card stays uncluttered. */}
+          {pendingJobs.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setPendingOpen(true)}
+              aria-label={`${pendingJobs.length} nguồn đang chờ — xem danh sách`}
+              title={`${pendingJobs.length} nguồn đang chờ — bấm để xem danh sách`}
+              className="inline-flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2.5 py-1 text-sm font-semibold text-amber-600 transition hover:bg-amber-500/20 dark:text-amber-300"
+            >
+              {pendingJobs.length} đang chờ
+            </button>
+          )}
+          <Modal open={pendingOpen} onClose={() => setPendingOpen(false)} title="Nguồn đang chờ tạo video" maxWidthClass="max-w-3xl">
+            {pendingJobs.length === 0 ? (
+              <p className="text-sm text-muted">Không có nguồn nào đang chờ.</p>
+            ) : (
+              <div className="space-y-3">
+                <p className="text-xs text-muted">
+                  Danh sách nguồn đã lưu, sẽ chạy khi bấm "Tạo video". Chỉ xem — không sửa được ở đây; muốn bỏ nguồn nào
+                  thì xoá.
+                </p>
+
+                {/* Column header — mirrors the "Thêm danh sách video" modal grid. */}
+                <div className="grid grid-cols-[1fr_1fr_auto] items-center gap-2 px-0.5 text-[11px] font-medium text-muted">
+                  <span>Link nguồn</span>
+                  <span>Tiêu đề</span>
+                  <span className="w-8" aria-hidden />
+                </div>
+
+                <div className="max-h-[60vh] space-y-2 overflow-y-auto pr-0.5">
+                  {pendingJobs.map((j) => (
+                    <div key={j.id} className="grid grid-cols-[1fr_1fr_auto] items-center gap-2">
+                      {/* Read-only cells styled like disabled TextInputs. */}
+                      <div
+                        className="truncate rounded-lg border border-line bg-panel2 px-3 py-2 text-sm text-fg"
+                        title={j.inputPayload}
+                      >
+                        {j.inputPayload}
+                      </div>
+                      <div
+                        className="truncate rounded-lg border border-line bg-panel2 px-3 py-2 text-sm text-fg"
+                        title={j.title ?? ''}
+                      >
+                        {j.title || <span className="text-muted">(chưa có tiêu đề)</span>}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => deletePending(j.id)}
+                        disabled={deletingId !== null}
+                        title="Xoá nguồn khỏi hàng chờ"
+                        aria-label="Xoá nguồn khỏi hàng chờ"
+                        className="flex h-8 w-8 items-center justify-center rounded-lg border border-line text-muted transition hover:border-rose-500/40 hover:text-rose-400 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:border-line disabled:hover:text-muted"
+                      >
+                        {deletingId === j.id ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <X className="h-4 w-4" />
+                        )}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                <p className="text-[11px] text-muted">{pendingJobs.length} nguồn đang chờ</p>
               </div>
             )}
+          </Modal>
+          {/* Stop button — only while running. Destructive red treatment. */}
+          {job && running && (
+            <div className="flex flex-col items-end">
+              <button
+                onClick={stop}
+                disabled={stopping}
+                title="Dừng workflow đang chạy"
+                aria-label="Dừng workflow"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-rose-500/50 bg-rose-500/10 px-2.5 py-1 text-sm font-semibold text-rose-600 transition hover:bg-rose-500/20 hover:text-rose-700 disabled:opacity-50 dark:text-rose-300 dark:hover:text-rose-200"
+              >
+                {stopping
+                  ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  : <Square className="h-3.5 w-3.5 fill-current" />}
+                Dừng
+              </button>
+              {stopErr && <p className="mt-1 line-clamp-2 text-right text-[10px] text-rose-500">{stopErr}</p>}
+            </div>
+          )}
+          {job && (
             <span
               className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-2.5 py-1 text-sm font-semibold tabular-nums ${
                 hasError
@@ -2112,8 +4347,8 @@ function WorkflowProgress({ pageId, trigger }: { pageId: number; trigger?: numbe
               <Clock className="h-3.5 w-3.5" />
               {fmtClock(elapsedS)}
             </span>
-          </div>
-        )}
+          )}
+        </div>
       </div>
 
       {/* Selected-options chips for the tracked job (what the user picked):
@@ -2193,7 +4428,59 @@ function WorkflowProgress({ pageId, trigger }: { pageId: number; trigger?: numbe
                   : stopped
                     ? 'Đã dừng bởi người dùng' /* neutral, not an error */
                     : done
-                      ? doneLabel
+                      ? (
+                        editingDoneTitle && doneVideo ? (
+                          <span className="inline-flex items-center gap-1.5 align-middle">
+                            <input
+                              type="text"
+                              value={doneTitleDraft}
+                              onChange={(e) => setDoneTitleDraft(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') { e.preventDefault(); void saveDoneTitle() }
+                                if (e.key === 'Escape') setEditingDoneTitle(false)
+                              }}
+                              autoFocus
+                              aria-label="Sửa tiêu đề"
+                              className="min-w-0 rounded-lg border border-line bg-panel px-2 py-1 text-base text-fg outline-none focus:border-brand/50 focus:ring-2 focus:ring-brand/20"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => void saveDoneTitle()}
+                              disabled={savingDoneTitle}
+                              title="Lưu"
+                              aria-label="Lưu tiêu đề"
+                              className="grid h-7 w-7 place-items-center rounded-lg text-emerald-500 transition hover:bg-emerald-500/10 disabled:opacity-50"
+                            >
+                              {savingDoneTitle ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setEditingDoneTitle(false)}
+                              disabled={savingDoneTitle}
+                              title="Hủy"
+                              aria-label="Hủy"
+                              className="grid h-7 w-7 place-items-center rounded-lg text-muted transition hover:bg-panel2 hover:text-fg disabled:opacity-50"
+                            >
+                              <X className="h-4 w-4" />
+                            </button>
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1.5 align-middle">
+                            {doneLabel}
+                            {doneVideo && (
+                              <button
+                                type="button"
+                                onClick={() => { setDoneTitleDraft(doneVideo.title); setEditingDoneTitle(true) }}
+                                title="Sửa tiêu đề"
+                                aria-label="Sửa tiêu đề"
+                                className="grid h-6 w-6 place-items-center rounded-lg text-muted transition hover:bg-panel2 hover:text-fg"
+                              >
+                                <Pencil className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                          </span>
+                        )
+                      )
                       : running
                         ? '' /* progress now shown under the active chip + on the bar */
                         : job.finishedAt
@@ -2248,10 +4535,10 @@ function WorkflowProgress({ pageId, trigger }: { pageId: number; trigger?: numbe
                 className={`h-full rounded-full transition-all duration-500 ${hasError ? 'bg-rose-500' : done ? 'bg-emerald-500' : stopped ? 'bg-slate-400 dark:bg-slate-500' : 'bg-brand'}`}
                 // Idle (nothing running) → 0%; otherwise the live percentage.
                 // A stopped job freezes the bar at how far it got (neutral gray).
-                style={{ width: `${running || done ? Math.max(2, pct) : stopped ? Math.max(2, pct) : 0}%` }}
+                style={{ width: `${running ? Math.max(2, pct) : stopped ? Math.max(2, pct) : 0}%` }}
               />
             </div>
-            {(running || done || hasError || stopped) && (
+            {(running || hasError || stopped) && (
               <span className="w-14 shrink-0 text-right text-lg font-semibold tabular-nums text-fg">{pct}%</span>
             )}
           </div>
@@ -2519,7 +4806,7 @@ function AddVoiceModal({
           Tải lên mẫu tiếng Việt một người nói, sạch (~5–15s, wav/flac/ogg). Sample rate nào cũng được; không nhạc/tạp âm.
         </p>
         <Field label="Voice clone model" hint={VOICE_CLONE_MODELS.find((m) => m.value === cloneModel)?.desc}>
-          <Select value={cloneModel} onChange={setCloneModel}>
+          <Select value={cloneModel} onChange={setCloneModel} settingKey="voiceUpload.cloneModel" autoApplyDefault>
             {VOICE_CLONE_MODELS.map((m) => (
               <option key={m.value} value={m.value}>
                 {m.label}

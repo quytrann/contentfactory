@@ -1,7 +1,7 @@
-import { createContext, useContext, useRef, useState } from 'react'
+import { createContext, useContext, useEffect, useRef, useState } from 'react'
 import type { ComponentType, ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { CheckCircle2, Facebook, Instagram, Music2, Search, Twitter, X, XCircle, Youtube } from 'lucide-react'
+import { CheckCircle2, Facebook, Instagram, Music2, Search, Star, Twitter, X, XCircle, Youtube } from 'lucide-react'
 import type { Platform } from './types'
 
 // Custom brand icons not in lucide-react
@@ -142,13 +142,15 @@ const STATUS_TONE: Record<string, string> = {
   running: 'amber', queued: 'amber', rendering: 'amber', pending: 'amber', paused: 'amber', needs_input: 'amber',
   failed: 'rose', blocked: 'rose', terminated: 'rose',
   // 'stopped' = user-stopped job: a NEUTRAL terminal state, never red. Gray.
-  not_started: 'slate', archived: 'slate', draft: 'slate', stopped: 'slate',
+  // 'held' = saved but not yet running (waiting for release): neutral gray, so it
+  // reads as "not yet running" distinct from the amber "queued/running" family.
+  not_started: 'slate', archived: 'slate', draft: 'slate', stopped: 'slate', held: 'slate',
 }
 
 // Domain status → Vietnamese label for display.
 const STATUS_LABEL: Record<string, string> = {
   queued: 'chờ xử lý', running: 'đang chạy', done: 'xong', failed: 'lỗi',
-  needs_input: 'Chờ nhập nguồn', stopped: 'Đã dừng',
+  needs_input: 'Chờ nhập nguồn', stopped: 'Đã dừng', held: 'đã lưu',
   rendering: 'đang dựng', ready: 'sẵn sàng', published: 'đã đăng',
   pending: 'chờ duyệt', draft: 'bản nháp', posted: 'đã đăng', approved: 'đã duyệt',
   not_started: 'Chưa liên kết', active: 'đã liên kết', paused: 'tạm dừng',
@@ -228,21 +230,123 @@ export function TextInput({
   )
 }
 
+// localStorage namespace for per-control "set as default" preferences.
+const DEFAULT_PREF_PREFIX = 'cf.default.'
+
+// Read/write a per-control default value under the shared `cf.default.<settingKey>`
+// namespace. Best-effort: storage failures (private mode/quota) are swallowed.
+// Exported so the bespoke VoicePicker reuses the SAME key convention as Select —
+// the prefix can never drift between the two implementations.
+export function getDefaultPref(settingKey: string): string | null {
+  try {
+    return localStorage.getItem(`${DEFAULT_PREF_PREFIX}${settingKey}`)
+  } catch {
+    return null
+  }
+}
+export function setDefaultPref(settingKey: string, value: string): void {
+  try {
+    localStorage.setItem(`${DEFAULT_PREF_PREFIX}${settingKey}`, value)
+  } catch {
+    /* best-effort; ignore storage failures */
+  }
+}
+// Un-set a stored default (the ★ toggled off). Same best-effort contract as setDefaultPref.
+export function clearDefaultPref(settingKey: string): void {
+  try {
+    localStorage.removeItem(`${DEFAULT_PREF_PREFIX}${settingKey}`)
+  } catch {
+    /* best-effort; ignore storage failures */
+  }
+}
+
 export function Select({
   value,
   onChange,
   children,
   className = '',
+  settingKey,
+  autoApplyDefault = false,
 }: {
   value: string
   onChange: (v: string) => void
   children: ReactNode
   className?: string
+  // When set, enables a hover "set as default" affordance (a ★) backed by
+  // localStorage under `cf.default.<settingKey>`. Must be STABLE + UNIQUE per
+  // dropdown (do not derive from index/label). Omit to keep a plain <select>.
+  settingKey?: string
+  // Opt-in: apply the stored default via onChange on mount so it pre-fills the
+  // field. ONLY safe for dropdowns that start from a fresh/blank form — NEVER
+  // for a dropdown that reflects already-persisted data (would clobber it).
+  autoApplyDefault?: boolean
 }) {
+  const [storedDefault, setStoredDefault] = useState<string | null>(null)
+
+  // Read the stored default once on mount; optionally apply it to the field.
+  useEffect(() => {
+    if (!settingKey) return
+    const saved = getDefaultPref(settingKey)
+    if (saved == null) return
+    setStoredDefault(saved)
+    // Only pre-fill when explicitly opted in AND the value actually differs, so
+    // we never fire a redundant onChange nor override an edit-context value.
+    if (autoApplyDefault && saved !== value) onChange(saved)
+    // Run once per settingKey; value/onChange intentionally excluded so a user
+    // edit after mount is never reverted to the stored default.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingKey])
+
+  const isDefault = storedDefault != null && storedDefault === value
+
+  // Toggle: clicking the ★ while this value IS the stored default un-sets it;
+  // otherwise it sets this value as the new default (replacing any other).
+  const toggleDefault = () => {
+    if (!settingKey) return
+    if (isDefault) {
+      clearDefaultPref(settingKey)
+      setStoredDefault(null)
+    } else {
+      setDefaultPref(settingKey, value)
+      setStoredDefault(value)
+    }
+  }
+
+  // Plain <select> when the feature is not opted into (no settingKey).
+  if (!settingKey) {
+    return (
+      <select value={value} onChange={(e) => onChange(e.target.value)} className={`${FIELD_CLS} ${className}`}>
+        {children}
+      </select>
+    )
+  }
+
   return (
-    <select value={value} onChange={(e) => onChange(e.target.value)} className={`${FIELD_CLS} ${className}`}>
-      {children}
-    </select>
+    <div className="group relative">
+      {/* pr-14 reserves room so the ★ sits left of the native arrow, never over it. */}
+      <select value={value} onChange={(e) => onChange(e.target.value)} className={`${FIELD_CLS} ${className} pr-14`}>
+        {children}
+      </select>
+      <button
+        type="button"
+        // preventDefault stops the wrapping <Field> <label> from forwarding this
+        // click to the <select> (which would open it right after saving).
+        onClick={(e) => {
+          e.preventDefault()
+          toggleDefault()
+        }}
+        title={isDefault ? 'Đang là mặc định — bấm để bỏ' : 'Đặt làm mặc định'}
+        aria-label={isDefault ? 'Đang là mặc định' : 'Đặt làm mặc định'}
+        aria-pressed={isDefault}
+        className={`absolute right-7 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center rounded transition ${
+          isDefault
+            ? 'text-amber-500 opacity-100 dark:text-amber-400'
+            : 'text-muted opacity-0 hover:text-amber-500 focus:opacity-100 group-hover:opacity-100 dark:text-muted dark:hover:text-amber-400'
+        }`}
+      >
+        <Star className={`h-3.5 w-3.5 ${isDefault ? 'fill-current' : ''}`} />
+      </button>
+    </div>
   )
 }
 
@@ -383,18 +487,18 @@ export function useToast(): { success: (msg: string) => void; error: (msg: strin
 function Toaster({ toasts, dismiss }: { toasts: ToastEntry[]; dismiss: (id: number) => void }) {
   if (!toasts.length) return null
   return createPortal(
-    <div className="pointer-events-none fixed right-4 top-4 z-[200] flex flex-col gap-2">
+    <div className="pointer-events-none fixed right-4 top-[26px] z-[200] flex flex-col gap-2">
       {toasts.map(t => (
         <div
           key={t.id}
           className={`pointer-events-auto flex animate-rise items-center gap-2.5 rounded-xl border px-4 py-2.5 text-sm shadow-card ${
             t.type === 'success'
-              ? 'border-emerald-500/40 bg-emerald-800/90 text-white'
+              ? 'border-brand/40 bg-brand/90 text-white'
               : 'border-rose-500/30 bg-rose-950/95 text-white'
           }`}
         >
           {t.type === 'success'
-            ? <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-300" />
+            ? <CheckCircle2 className="h-4 w-4 shrink-0 text-white/80" />
             : <XCircle className="h-4 w-4 shrink-0 text-rose-400" />}
           <span className="flex-1">{t.message}</span>
           <button

@@ -1,0 +1,29 @@
+{
+  "id": "chatcmpl-fixture",
+  "object": "chat.completion",
+  "created": 1785000000,
+  "model": "nvidia/nemotron-3-nano-30b-a3b:free",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "[\n  {\n    \"scene\": 1,\n    \"narration\": \"Three out of four teams gave up and went back to a paid API within a quarter.\",\n    \"sourceStart\": 19.0,\n    \"sourceEnd\": 26.0\n  },\n  {\n    \"scene\": 2,\n    \"narration\": \"The first mistake is benchmarking the model instead of benchmarking the pipeline.\",\n    \"sourceStart\": 58.2,\n    \"sourceEnd\": 65.0\n  },\n  {\n    \"scene\": 3,\n    \"narration\": \"On an eight gigabyte card, memory is the whole game: weights plus KV cache.\",\n    \"sourceStart\": 101.0,\n    \"sourceEnd\": 108.0\n  },\n  {\n    \"scene\": 4,\n    \"narration\": \"Structured output support is a property of the endpoint, not of the model.\",\n    \"sourceStart\": 199.0,\n    \"sourceEnd\": 206.0\n  },\n  {\n    \"scene\": 5,\n    \"narration\": \"Free catalogues rotate, so a hardcoded model identifier is a time bomb.\",\n    \"sourceStart\": 297.5,\n    \"sourceEnd\": 304.0\n  },\n  {\n    \"scene\": 6,\n    \"narration\": \"Nobody measures quality in their own language, and English leaderboards do not transfer.\",\n    \"sourceStart\": 325.5,\n    \"sourceEnd\": 333.0\n  },\n  {\n    \"scene\": 7,\n    \"narration\": \"Build a ladder: a primary, a secondary, and a local floor that never fully stops.\",\n    \"sourceStart\": 484.5,\n    \"sourceEnd\": 492.0\n  }\n]"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 3900,
+    "completion_tokens": 420,
+    "total_tokens": 4320
+  },
+  "_bench": {
+    "task": "footage_recap_600s",
+    "as_provider": "openrouter",
+    "expect_verdict": "FAIL",
+    "latency_sec": 22.7,
+    "structured": "json_schema",
+    "note": "Structurally perfect JSON but the narration came back in ENGLISH — a hard disqualifier for this pipeline. Exercises the VN% heuristic."
+  }
+}

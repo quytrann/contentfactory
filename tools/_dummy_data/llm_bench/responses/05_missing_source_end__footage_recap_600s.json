@@ -1,0 +1,29 @@
+{
+  "id": "chatcmpl-fixture",
+  "object": "chat.completion",
+  "created": 1785000000,
+  "model": "gemma-4-26b-a4b-it:free",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "[\n  {\n    \"scene\": 1,\n    \"narration\": \"Ba trên bốn nhóm đã quay lại dùng API trả phí chỉ sau một quý.\",\n    \"sourceStart\": 19.0,\n    \"sourceEnd\": 26.0\n  },\n  {\n    \"scene\": 2,\n    \"narration\": \"Ba trên bốn nhóm đã quay lại dùng API trả phí chỉ sau một quý.\",\n    \"sourceStart\": 58.2\n  },\n  {\n    \"scene\": 3,\n    \"narration\": \"Ba trên bốn nhóm đã quay lại dùng API trả phí chỉ sau một quý.\",\n    \"sourceStart\": 101.0\n  },\n  {\n    \"scene\": 4,\n    \"narration\": \"Ba trên bốn nhóm đã quay lại dùng API trả phí chỉ sau một quý.\",\n    \"sourceStart\": 199.0\n  },\n  {\n    \"scene\": 5,\n    \"narration\": \"Ba trên bốn nhóm đã quay lại dùng API trả phí chỉ sau một quý.\",\n    \"sourceStart\": 297.5\n  }\n]"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 3900,
+    "completion_tokens": 310,
+    "total_tokens": 4210
+  },
+  "_bench": {
+    "task": "footage_recap_600s",
+    "as_provider": "openrouter",
+    "expect_verdict": "FAIL",
+    "latency_sec": 15.1,
+    "structured": "none",
+    "note": "Dropped 'sourceEnd' on 4 of 5 scenes — the footage cut step cannot run. Exercises the required-keys check (this is what happens without json_schema)."
+  }
+}

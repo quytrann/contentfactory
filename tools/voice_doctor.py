@@ -124,12 +124,13 @@ def engine_from_name(ref_audio: str) -> str:
 
 
 def engine_label(engine_key: str, stem: str) -> str:
-    """Display label: F5-TTS / VieNeu / 'VieNeu (legacy)' for suffix-less files."""
+    """Display label: F5-TTS / VieNeu / 'VieNeu (legacy)' for suffix-less files.
+    Suffix-less = pre-F5 default era; treated as VieNeu for backward compat."""
     has_suffix = any(stem.lower().endswith(" - " + s.lower())
                      for s in _CLONE_MODEL_SHORT.values())
     if engine_key == "f5-tts":
         return "F5-TTS"
-    return "VieNeu" if has_suffix else "legacy"
+    return "VieNeu" if has_suffix else "VieNeu (legacy)"
 
 
 # --- fingerprint + sidecar (mirror of tts_worker) -----------------------------
